@@ -500,8 +500,11 @@ def harvest(cfg: Cfg, state: dict) -> None:
     write_json_atomic(os.path.join(cfg.root, name, CRED_FILE), live)
 
 
-def do_swap(cfg: Cfg, state: dict, target: Account, reason: str) -> None:
+def do_swap(cfg: Cfg, state: dict, target: Account, reason: str) -> str:
+    """Swap the live credentials to `target`. Returns the human-readable detail
+    ("left <prev>: <reason>") so callers can show the same text in notices."""
     old = oauth_of(read_json(cfg.live_path)) or {}
+    prev = state.get("active")
     harvest(cfg, state)
 
     creds = target.read()
@@ -517,7 +520,8 @@ def do_swap(cfg: Cfg, state: dict, target: Account, reason: str) -> None:
     write_json_atomic(cfg.live_path, creds)
     state["active"] = target.name
     state["last_swap"] = now()
-    add_event(state, f"→ {target.name} ({reason})")
+    detail = f"left {prev}: {reason}" if prev and prev != target.name else reason
+    add_event(state, f"→ {target.name} ({detail})")
     save_state(cfg, state)
 
     # Guard against the one narrow race: the running CLI finishing a token
@@ -531,6 +535,7 @@ def do_swap(cfg: Cfg, state: dict, target: Account, reason: str) -> None:
         write_json_atomic(cfg.live_path, creds)
         add_event(state, "re-asserted swap over a concurrent write")
         save_state(cfg, state)
+    return detail
 
 
 # --- rotation policy ------------------------------------------------------------
@@ -887,9 +892,9 @@ def cmd_watch(cfg: Cfg, a: Ansi) -> int:
                 notice = "active account exhausted but no fallback has headroom"
             return
         try:
-            do_swap(cfg, state, get_account(cfg, target), reason)
+            detail = do_swap(cfg, state, get_account(cfg, target), reason)
             monitor.note_own_write()
-            notice = f"rotated to {target} ({reason})"
+            notice = f"rotated to {target} ({detail})"
             poll_active()
         except CcrollError as e:
             notice = f"rotation failed: {e}"
@@ -961,9 +966,9 @@ def cmd_watch(cfg: Cfg, a: Ansi) -> int:
                     target = pick_target(usages, cfg, exclude=state.get("active"))
                     if target:
                         try:
-                            do_swap(cfg, state, get_account(cfg, target), "manual (keypress)")
+                            detail = do_swap(cfg, state, get_account(cfg, target), "manual (keypress)")
                             monitor.note_own_write()
-                            notice = f"rotated to {target}"
+                            notice = f"rotated to {target} ({detail})"
                             poll_active()
                         except CcrollError as e:
                             notice = f"rotation failed: {e}"
