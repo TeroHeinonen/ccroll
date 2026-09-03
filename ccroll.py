@@ -72,7 +72,8 @@ SWAP_VERIFY_DELAY_S = 2.0       # re-check the live file this long after a swap
 SAMPLE_RETENTION_S = 24 * 3600  # keep at most a day of burn-rate samples
 BURN_WINDOW_S = 45 * 60         # fit burn rate over the last 45 minutes
 BURN_MIN_SAMPLES = 3
-BURN_MIN_SPAN_S = 8 * 60
+BURN_MIN_SPAN_S = 90            # 3 polls at the 60s default: a figure after ~2 min
+BURN_SETTLED_SPAN_S = 8 * 60    # shorter fits are shown dimmed as provisional
 BURN_MIN_RATE = 0.05            # %/h below this shows as idle
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@+-]{0,127}$")  # account emails
 LIVE_PSEUDO = "(live login)"  # display row for a live login not in the store
@@ -466,8 +467,9 @@ def append_sample(state: dict, name: str, window: str, pct: float | None) -> Non
         series.pop(0)
 
 
-def burn_rate(series: list) -> float | None:
-    """Least-squares slope in %/hour over the recent sample window."""
+def burn_fit(series: list) -> tuple[float, float] | None:
+    """Least-squares slope in %/hour over the recent sample window, plus the
+    span in seconds the fit covers (short spans are provisional)."""
     if not series:
         return None
     latest = series[-1][0]
@@ -480,7 +482,7 @@ def burn_rate(series: list) -> float | None:
     denom = sum((t - mt) ** 2 for t, _ in pts)
     if denom == 0:
         return None
-    return (sum((t - mt) * (p - mp) for t, p in pts) / denom) * 3600
+    return (sum((t - mt) * (p - mp) for t, p in pts) / denom) * 3600, pts[-1][0] - pts[0][0]
 
 
 def eta_to_limit(pct: float | None, rate: float | None) -> float | None:
@@ -651,7 +653,9 @@ def render_burn(a: Ansi, state: dict, name: str, u: Usage | None, scoped_label: 
         if pct is None:
             continue
         series = state["samples"].get(name, {}).get(key, [])
-        rate = burn_rate(series)
+        fit = burn_fit(series)
+        rate, span = fit if fit else (None, 0.0)
+        provisional = fit is not None and span < BURN_SETTLED_SPAN_S
         eta = eta_to_limit(pct, rate)
         reset_in = (reset - now()) if reset else None
         parts = [f"{pct:5.1f}%"]
@@ -663,7 +667,7 @@ def render_burn(a: Ansi, state: dict, name: str, u: Usage | None, scoped_label: 
             burn = "~0%/h"
         else:
             burn = f"{rate:.1f}%/h"
-        parts.append(f"burn {burn:>9}")
+        parts.append(a.dim(f"burn {burn:>9}") if provisional else f"burn {burn:>9}")
         # duration cells are padded to "0d 00h 00m" so a "—" (no burn data,
         # or already at the limit) doesn't shift the columns after it
         def dur_cell(secs: float | None) -> str:

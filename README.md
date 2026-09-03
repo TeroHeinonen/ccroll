@@ -16,9 +16,9 @@ ccroll 0.1.0  ·  auto-rotate at session≥90% / fable≥97%  ·  22:04:31
    ops@example.com     12% ↺0d 04h 41m    8% ↺6d 01h 33m    9% ↺6d 01h 33m  ok
 
 burn · tero@example.com
-  session        62.3%  ·  burn 14.2%/h  ·  limit in ≈0d 02h 39m  ·  resets in 0d 02h 10m  ✓ reset first
-  weekly·all     31.0%  ·  burn 1.1%/h   ·  resets in 3d 02h 40m
-  weekly·fable   45.2%  ·  burn 1.9%/h   ·  limit in ≈1d 04h 12m  ·  resets in 5d 01h 12m  ⚠ limit first
+  session        62.3%  ·  burn   14.2%/h  ·  limit in ≈0d 02h 39m  ·  resets in 0d 02h 10m  ✓ reset first
+  weekly·all     31.0%  ·  burn    1.1%/h  ·  limit in ≈2d 14h 40m  ·  resets in 3d 02h 40m  ✓ reset first
+  weekly·fable   45.2%  ·  burn    1.9%/h  ·  limit in ≈1d 04h 12m  ·  resets in 5d 01h 12m  ⚠ limit first
 
 next in line: ops@example.com
 
@@ -104,7 +104,7 @@ Tuning: `--threshold`, `--scoped-threshold`, `--interval` (active-account poll, 
 
 Every duration — resets, limit ETAs, token expiries — is shown in a fixed `0d 00h 00m` format with days, hours and minutes each in their own color (zero-value leading units dimmed), so remaining time reads in a single glance.
 
-The dashboard samples the active account's three windows (session / weekly-all / weekly-scoped) once per minute and fits a least-squares slope over the last 45 minutes. From that it shows the burn rate (%/h), the estimated time until each limit is hit, the time until each window resets — and which comes first (`✓ reset first` / `⚠ limit first`). A window reset clears its series automatically. Estimates need ~10 minutes of samples before they appear.
+The dashboard samples the active account's three windows (session / weekly-all / weekly-scoped) once per minute and fits a least-squares slope over the last 45 minutes. From that it shows the burn rate (%/h), the estimated time until each limit is hit, the time until each window resets — and which comes first (`✓ reset first` / `⚠ limit first`). A window reset clears its series automatically. A first estimate appears after ~2 minutes (three samples) and is shown dimmed until the fit covers 8 minutes; a session can burn out in 10 minutes, so an early rough number beats none.
 
 ## What ccroll writes, and where
 
