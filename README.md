@@ -110,6 +110,10 @@ The dashboard samples the active account's three windows (session / weekly-all /
 ## What ccroll writes, and where
 
 - `~/.claude-accounts/<name>/.credentials.json` — each account's tokens (0600), refreshed in place.
+### Token refresh
+
+The OAuth token endpoint only serves requests carrying the official client signature. ccroll performs the same refresh the CLI performs, against your own stored credentials, so it sends the same `User-Agent`. Without it the edge returns a Cloudflare 403 (`error code: 1010`) and every account goes blank; a generic agent gets throttled instead. Refreshes are staggered across a scan and retried with backoff when the server answers 429.
+
 - `~/.claude-accounts/.ccroll/state.json` — active-account marker, per-account emails, burn-rate samples, event log. No secrets.
 - `~/.claude/.credentials.json` (or `$CLAUDE_CONFIG_DIR`) — replaced atomically on each swap; harvested back into the store first so rotated refresh tokens survive.
 

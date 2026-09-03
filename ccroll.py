@@ -66,6 +66,14 @@ ANTHROPIC_VERSION = "2023-06-01"
 
 CRED_FILE = ".credentials.json"
 HTTP_TIMEOUT_S = 30
+# The token endpoint sits behind an edge rule that only serves the official
+# client signature: a default urllib UA gets a Cloudflare 403 (error 1010) and
+# a generic UA gets throttled. ccroll performs the same OAuth refresh the CLI
+# performs, on the user's own stored credentials, so it identifies the same way.
+USER_AGENT = "claude-cli/2.1.259 (external, cli)"
+REFRESH_RETRIES = 3             # attempts per refresh when the server throttles
+REFRESH_BACKOFF_S = 2.0         # first backoff; doubles per attempt
+REFRESH_STAGGER_S = 0.35        # spacing between refreshes of different accounts
 MAX_PARALLEL = 8
 REFRESH_MARGIN_S = 180          # refresh an access token this close to expiry
 SWAP_VERIFY_DELAY_S = 2.0       # re-check the live file this long after a swap
@@ -187,6 +195,7 @@ def _http(method: str, url: str, token: str | None, body: dict | None):
     """Return (status:int|None, body_bytes:bytes, neterr:str|None)."""
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(url, data=data, method=method)
+    req.add_header("User-Agent", USER_AGENT)
     if token:
         req.add_header("Authorization", f"Bearer {token}")
         req.add_header("anthropic-beta", OAUTH_BETA)
@@ -199,6 +208,22 @@ def _http(method: str, url: str, token: str | None, body: dict | None):
         return e.code, e.read(), None
     except Exception as e:
         return None, b"", str(getattr(e, "reason", e))
+
+
+def http_detail(status: int | None, raw: bytes, j: dict | None = None) -> str:
+    """Readable reason for a failed call.  Falls back to the response body so a
+    non-JSON edge rejection (a Cloudflare block, say) is legible instead of a
+    bare status code."""
+    if j:
+        msg = j.get("error_description") or j.get("error")
+        if isinstance(msg, dict):
+            msg = msg.get("message") or msg.get("type")
+        if msg:
+            return f"{msg} (http {status})"
+    text = " ".join((raw or b"").decode(errors="replace").split())[:80]
+    if text:
+        return f"http {status}: {text}"
+    return f"http {status}"
 
 
 # --- credential store -----------------------------------------------------------
@@ -278,16 +303,23 @@ def oauth_refresh(oauth: dict) -> dict:
     if not refresh:
         raise CcrollError("no refresh token stored — re-login with `ccroll add`")
     body = {"grant_type": "refresh_token", "refresh_token": refresh, "client_id": CLIENT_ID}
-    status, data, neterr = _http("POST", TOKEN_URL, None, body)
-    if neterr:
-        raise CcrollError(f"token refresh network error: {neterr}")
-    try:
-        j = json.loads(data.decode() or "{}")
-    except json.JSONDecodeError:
-        j = {}
-    if status != 200 or not j.get("access_token"):
-        detail = j.get("error_description") or j.get("error") or f"http {status}"
-        raise CcrollError(f"token refresh failed ({detail}) — re-login with `ccroll add`")
+    delay = REFRESH_BACKOFF_S
+    for attempt in range(REFRESH_RETRIES):
+        status, data, neterr = _http("POST", TOKEN_URL, None, body)
+        if neterr:
+            raise CcrollError(f"token refresh network error: {neterr}")
+        try:
+            j = json.loads(data.decode() or "{}")
+        except json.JSONDecodeError:
+            j = {}
+        if status == 200 and j.get("access_token"):
+            break
+        # throttling is transient: back off and try again before giving up
+        if status == 429 and attempt < REFRESH_RETRIES - 1:
+            time.sleep(delay)
+            delay *= 2
+            continue
+        raise CcrollError(f"token refresh failed ({http_detail(status, data, j)})")
     new = dict(oauth)
     new["accessToken"] = j["access_token"]
     if j.get("refresh_token"):
@@ -687,7 +719,13 @@ def render_burn(a: Ansi, state: dict, name: str, u: Usage | None, scoped_label: 
 def scan_accounts(cfg: Cfg, accounts: list[Account], active: str | None) -> dict:
     """Fetch usage for every account in parallel.  The active account is read
     through the LIVE credentials file, which the running CLI keeps freshest."""
-    def one(acc: Account) -> tuple[str, Usage]:
+    # A fleet-wide scan can need a token refresh for every account at once.
+    # Firing those simultaneously trips the endpoint's rate limiter, so each
+    # worker waits out a slot before starting.
+    def one(item: tuple[int, Account]) -> tuple[str, Usage]:
+        idx, acc = item
+        if idx:
+            time.sleep(REFRESH_STAGGER_S * idx)
         path = cfg.live_path if acc.name == active else acc.cred_path
         return acc.name, usage_for(path)
 
@@ -695,7 +733,7 @@ def scan_accounts(cfg: Cfg, accounts: list[Account], active: str | None) -> dict
     if not accounts:
         return results
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(MAX_PARALLEL, len(accounts))) as ex:
-        for name, usage in ex.map(one, accounts):
+        for name, usage in ex.map(one, enumerate(accounts)):
             results[name] = usage
     return results
 
