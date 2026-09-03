@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ccroll"
+version = "0.1.0"
+description = "Hands your long-running Claude Code session from one subscription account to the next — quota-aware live credential rotation with a terminal dashboard."
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "Tero Heinonen" }]
+requires-python = ">=3.10"
+keywords = ["claude", "claude-code", "quota", "rate-limit", "account-rotation"]
+classifiers = [
+    "Environment :: Console",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: Utilities",
+]
+
+[project.scripts]
+ccroll = "ccroll:main"
+
+[tool.setuptools]
+py-modules = ["ccroll"]
