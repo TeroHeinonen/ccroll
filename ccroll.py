@@ -664,10 +664,14 @@ def render_burn(a: Ansi, state: dict, name: str, u: Usage | None, scoped_label: 
         else:
             burn = f"{rate:.1f}%/h"
         parts.append(f"burn {burn:>9}")
-        if eta is not None:
-            parts.append("limit in ≈" + fmt_dur3(a, eta)[0])
+        # duration cells are padded to "0d 00h 00m" so a "—" (no burn data,
+        # or already at the limit) doesn't shift the columns after it
+        def dur_cell(secs: float | None) -> str:
+            text, width = fmt_dur3(a, secs)
+            return text + " " * max(0, 10 - width)
+        parts.append("limit in ≈" + dur_cell(eta))
         if reset_in is not None and reset_in > 0:
-            parts.append("resets in " + fmt_dur3(a, reset_in)[0])
+            parts.append("resets in " + dur_cell(reset_in))
         verdict = ""
         if eta is not None and reset_in is not None and reset_in > 0:
             verdict = a.green("✓ reset first") if reset_in < eta else a.red("⚠ limit first")
