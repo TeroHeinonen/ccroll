@@ -2,7 +2,8 @@
 
 **Hands your long-running Claude Code session from one subscription account to the next — without breaking stride.**
 
-You're deep into an interactive Claude Code session: hours of context, subagents running, a compaction or two behind you. Then the 5-hour window (or the weekly limit) runs out. Restarting under another account kills your subagents and costs you the re-fill of the whole context anyway. Switching by hand — `/login`, browser, password manager — breaks your flow a dozen times a week.
+You're deep into an interactive Claude Code session: hours of context, subagents running, a compaction or two behind you. Then the 5-hour window (or the weekly limit) runs out. Restarting under another account kills your subagents and costs you the re-fill of the whole context anyway. Hitting token limits kills all your subtasks requiring restart and scanning the status. This restart can
+take 25% of your session token quota. And switching by hand — `/login`, browser, login rituals — breaks your flow a dozen times a week (or per day if you fan out your work).
 
 ccroll removes the chore. It runs in its own terminal as a live dashboard over all of your accounts, estimates when the active one will hit its limits, and **hot-swaps the live credentials to the account with the most headroom** — while your session keeps running, untouched.
 
