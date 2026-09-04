@@ -246,7 +246,7 @@ class Cfg:
         self.live_dir = os.path.expanduser(live_dir)
         self.live_path = os.path.join(self.live_dir, CRED_FILE)
         self.state_path = os.path.join(self.root, ".ccroll", "state.json")
-        self.threshold = float(getattr(args, "threshold", 97))
+        self.threshold = float(getattr(args, "threshold", 95))
         self.scoped_threshold = float(getattr(args, "scoped_threshold", 97))
         self.interval = max(15, int(getattr(args, "interval", 60)))
         self.scan = max(self.interval, int(getattr(args, "scan", 300)))
@@ -1200,7 +1200,7 @@ def main(argv: list[str] | None = None) -> int:
     sub = p.add_subparsers(dest="cmd")
 
     w = sub.add_parser("watch", help="live dashboard + auto-rotation (default)")
-    w.add_argument("--threshold", type=float, default=97, help="rotate when session %% reaches this (default 97)")
+    w.add_argument("--threshold", type=float, default=95, help="rotate when session %% reaches this (default 95)")
     w.add_argument("--scoped-threshold", type=float, default=97,
                    help="rotate when the per-model weekly %% reaches this (default 97)")
     w.add_argument("--interval", type=int, default=60, help="active-account poll seconds (default 60)")
