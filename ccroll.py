@@ -75,6 +75,7 @@ REFRESH_RETRIES = 3             # attempts per refresh when the server throttles
 REFRESH_BACKOFF_S = 2.0         # first backoff; doubles per attempt
 REFRESH_STAGGER_S = 0.35        # spacing between refreshes of different accounts
 MAX_PARALLEL = 8
+MAX_TARGET_TRIES = 4            # fresh-read confirmations before giving up on a swap
 REFRESH_MARGIN_S = 180          # refresh an access token this close to expiry
 SWAP_VERIFY_DELAY_S = 2.0       # re-check the live file this long after a swap
 SAMPLE_RETENTION_S = 24 * 3600  # keep at most a day of burn-rate samples
@@ -245,11 +246,11 @@ class Cfg:
         self.live_dir = os.path.expanduser(live_dir)
         self.live_path = os.path.join(self.live_dir, CRED_FILE)
         self.state_path = os.path.join(self.root, ".ccroll", "state.json")
-        self.threshold = float(getattr(args, "threshold", 90))
-        self.scoped_threshold = float(getattr(args, "scoped_threshold", 95))
+        self.threshold = float(getattr(args, "threshold", 97))
+        self.scoped_threshold = float(getattr(args, "scoped_threshold", 97))
         self.interval = max(15, int(getattr(args, "interval", 60)))
         self.scan = max(self.interval, int(getattr(args, "scan", 300)))
-        self.cooldown = int(getattr(args, "cooldown", 300))
+        self.cooldown = int(getattr(args, "cooldown", 0))
         self.rotate = not getattr(args, "no_rotate", False)
         # which weekly limit governs exhaustion + next-account choice:
         # "scoped" = the per-model weekly limit (Fable on current Max plans),
@@ -589,11 +590,14 @@ def is_exhausted(u: Usage | None, cfg: Cfg) -> str | None:
 
 
 def pick_target(usages: dict, cfg: Cfg, exclude: str | None) -> str | None:
+    """Least-loaded account that is not spent.  The sort key ends in the account
+    name so equal usage always resolves the same way, whatever order the scan
+    returned."""
     def key(item):
-        u = item[1]
+        name, u = item
         if cfg.mode == "weekly":
-            return (u.weekly_pct or 0, u.session_pct or 0, u.scoped_pct or 0)
-        return (u.scoped_pct or 0, u.session_pct or 0, u.weekly_pct or 0)
+            return (u.weekly_pct or 0, u.session_pct or 0, u.scoped_pct or 0, name)
+        return (u.scoped_pct or 0, u.session_pct or 0, u.weekly_pct or 0, name)
 
     ok = [(n, u) for n, u in usages.items()
           if n != exclude and n != LIVE_PSEUDO
@@ -605,6 +609,28 @@ def pick_target(usages: dict, cfg: Cfg, exclude: str | None) -> str | None:
               and (cfg.mode != "scoped" or (u.scoped_pct or 0) < 90)]
     pool = strict or ok
     return min(pool, key=key)[0] if pool else None
+
+
+def verified_target(cfg: Cfg, usages: dict, active: str | None) -> str | None:
+    """pick_target, but with the choice confirmed against a fresh read before we
+    commit to it.  Fleet data can be up to `--scan` seconds old, and an account
+    may have been consumed elsewhere in that time; never swap onto one that is
+    already spent.  Rejected candidates stay rejected for this pass."""
+    skip: set[str] = set()
+    for _ in range(MAX_TARGET_TRIES):
+        pool = {n: u for n, u in usages.items() if n not in skip}
+        target = pick_target(pool, cfg, exclude=active)
+        if not target:
+            return None
+        fresh = usage_for(get_account(cfg, target).cred_path)
+        if fresh.error:
+            skip.add(target)          # unreadable now; try the next best
+            continue
+        usages[target] = fresh        # keep the dashboard honest either way
+        if not is_exhausted(fresh, cfg):
+            return target
+        skip.add(target)
+    return None
 
 
 def earliest_recovery(usages: dict, cfg: Cfg) -> tuple[float, str] | None:
@@ -927,7 +953,7 @@ def cmd_watch(cfg: Cfg, a: Ansi) -> int:
         reason = is_exhausted(usages.get(active), cfg)
         if not reason:
             return
-        target = pick_target(usages, cfg, exclude=active)
+        target = verified_target(cfg, usages, active)
         if not target:
             # everyone is spent: hold position and rescan the moment the first
             # account's binding limits have reset (plus a small settle buffer)
@@ -1012,7 +1038,7 @@ def cmd_watch(cfg: Cfg, a: Ansi) -> int:
                     paused = not paused
                     notice = "auto-rotation paused" if paused else "auto-rotation resumed"
                 elif key == "r":
-                    target = pick_target(usages, cfg, exclude=state.get("active"))
+                    target = verified_target(cfg, usages, state.get("active"))
                     if target:
                         try:
                             detail = do_swap(cfg, state, get_account(cfg, target), "manual (keypress)")
@@ -1174,12 +1200,14 @@ def main(argv: list[str] | None = None) -> int:
     sub = p.add_subparsers(dest="cmd")
 
     w = sub.add_parser("watch", help="live dashboard + auto-rotation (default)")
-    w.add_argument("--threshold", type=float, default=90, help="rotate when session %% reaches this (default 90)")
-    w.add_argument("--scoped-threshold", type=float, default=95,
-                   help="rotate when the per-model weekly %% reaches this (default 95)")
+    w.add_argument("--threshold", type=float, default=97, help="rotate when session %% reaches this (default 97)")
+    w.add_argument("--scoped-threshold", type=float, default=97,
+                   help="rotate when the per-model weekly %% reaches this (default 97)")
     w.add_argument("--interval", type=int, default=60, help="active-account poll seconds (default 60)")
     w.add_argument("--scan", type=int, default=300, help="all-accounts scan seconds (default 300)")
-    w.add_argument("--cooldown", type=int, default=300, help="min seconds between swaps (default 300)")
+    w.add_argument("--cooldown", type=int, default=0,
+                   help="min seconds between swaps (default 0: none needed, a swap "
+                        "requires the source to be spent and the target not to be)")
     w.add_argument("--no-rotate", action="store_true", help="dashboard only, never swap")
 
     sub.add_parser("status", help="one-shot usage table for all accounts")

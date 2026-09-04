@@ -8,7 +8,7 @@ take 25% of your session token quota. And switching by hand — `/login`, browse
 ccroll removes the chore. It runs in its own terminal as a live dashboard over all of your accounts, estimates when the active one will hit its limits, and **hot-swaps the live credentials to the account with the most headroom** — while your session keeps running, untouched.
 
 ```
-ccroll 0.1.0  ·  auto-rotate at session≥90% / fable≥95%  ·  22:04:31
+ccroll 0.1.0  ·  auto-rotate at session≥97% / fable≥97%  ·  22:04:31
 
    Account            Session (5h)      Weekly · all      Weekly · Fable    Status
 ─  ─────────────────  ────────────────  ────────────────  ────────────────  ──────
@@ -95,7 +95,9 @@ ccroll rotates away from the active account when any of these hold:
 
 **Which weekly limit governs is a flag.** Plans with a per-model weekly limit (e.g. the Fable limit on current Max plans) usually hit *that* wall first, so `--by scoped` (the default) treats it as the constraint and picks the next account by most scoped headroom. If you don't care about the per-model limit — or your plan has none — use `--by weekly` to govern by the all-models weekly limit instead.
 
-The next account is chosen by most headroom on the governing limit (with hysteresis: an account must be comfortably clear of the thresholds to qualify). Swaps have a cooldown (default 5 minutes) so the fleet never flaps.
+The next account is chosen by most headroom on the governing limit (with hysteresis: an account must be comfortably clear of the thresholds to qualify), and ties break on account name so the same fleet always resolves the same way. The choice is then confirmed against a fresh read of that account before the swap commits, because fleet data can be up to one scan old and an account may have been consumed on another machine meanwhile. ccroll never swaps onto an account that is already spent.
+
+**There is no swap cooldown**, and none is needed. A swap requires the account you are leaving to be spent and the one you are moving to not to be; usage within a window only rises, and only the active account consumes. Returning to an earlier account therefore requires that account's window to have reset, which is recovery rather than flapping. Set `--cooldown` if you want one anyway.
 
 **When every account is spent**, ccroll doesn't give up: it shows which account recovers first and waits for exactly that moment (the latest reset among that account's binding limits), then rescans and rotates as soon as headroom exists.
 
