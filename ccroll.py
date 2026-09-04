@@ -246,7 +246,7 @@ class Cfg:
         self.live_path = os.path.join(self.live_dir, CRED_FILE)
         self.state_path = os.path.join(self.root, ".ccroll", "state.json")
         self.threshold = float(getattr(args, "threshold", 90))
-        self.scoped_threshold = float(getattr(args, "scoped_threshold", 97))
+        self.scoped_threshold = float(getattr(args, "scoped_threshold", 95))
         self.interval = max(15, int(getattr(args, "interval", 60)))
         self.scan = max(self.interval, int(getattr(args, "scan", 300)))
         self.cooldown = int(getattr(args, "cooldown", 600))
@@ -1175,8 +1175,8 @@ def main(argv: list[str] | None = None) -> int:
 
     w = sub.add_parser("watch", help="live dashboard + auto-rotation (default)")
     w.add_argument("--threshold", type=float, default=90, help="rotate when session %% reaches this (default 90)")
-    w.add_argument("--scoped-threshold", type=float, default=97,
-                   help="rotate when the per-model weekly %% reaches this (default 97)")
+    w.add_argument("--scoped-threshold", type=float, default=95,
+                   help="rotate when the per-model weekly %% reaches this (default 95)")
     w.add_argument("--interval", type=int, default=60, help="active-account poll seconds (default 60)")
     w.add_argument("--scan", type=int, default=300, help="all-accounts scan seconds (default 300)")
     w.add_argument("--cooldown", type=int, default=600, help="min seconds between swaps (default 600)")

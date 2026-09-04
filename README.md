@@ -8,7 +8,7 @@ take 25% of your session token quota. And switching by hand — `/login`, browse
 ccroll removes the chore. It runs in its own terminal as a live dashboard over all of your accounts, estimates when the active one will hit its limits, and **hot-swaps the live credentials to the account with the most headroom** — while your session keeps running, untouched.
 
 ```
-ccroll 0.1.0  ·  auto-rotate at session≥90% / fable≥97%  ·  22:04:31
+ccroll 0.1.0  ·  auto-rotate at session≥90% / fable≥95%  ·  22:04:31
 
    Account            Session (5h)      Weekly · all      Weekly · Fable    Status
 ─  ─────────────────  ────────────────  ────────────────  ────────────────  ──────
