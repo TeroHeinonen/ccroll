@@ -95,7 +95,7 @@ ccroll rotates away from the active account when any of these hold:
 
 **Which weekly limit governs is a flag.** Plans with a per-model weekly limit (e.g. the Fable limit on current Max plans) usually hit *that* wall first, so `--by scoped` (the default) treats it as the constraint and picks the next account by most scoped headroom. If you don't care about the per-model limit — or your plan has none — use `--by weekly` to govern by the all-models weekly limit instead.
 
-The next account is chosen by most headroom on the governing limit (with hysteresis: an account must be comfortably clear of the thresholds to qualify). Swaps have a cooldown (default 10 minutes) so the fleet never flaps.
+The next account is chosen by most headroom on the governing limit (with hysteresis: an account must be comfortably clear of the thresholds to qualify). Swaps have a cooldown (default 5 minutes) so the fleet never flaps.
 
 **When every account is spent**, ccroll doesn't give up: it shows which account recovers first and waits for exactly that moment (the latest reset among that account's binding limits), then rescans and rotates as soon as headroom exists.
 

@@ -249,7 +249,7 @@ class Cfg:
         self.scoped_threshold = float(getattr(args, "scoped_threshold", 95))
         self.interval = max(15, int(getattr(args, "interval", 60)))
         self.scan = max(self.interval, int(getattr(args, "scan", 300)))
-        self.cooldown = int(getattr(args, "cooldown", 600))
+        self.cooldown = int(getattr(args, "cooldown", 300))
         self.rotate = not getattr(args, "no_rotate", False)
         # which weekly limit governs exhaustion + next-account choice:
         # "scoped" = the per-model weekly limit (Fable on current Max plans),
@@ -1179,7 +1179,7 @@ def main(argv: list[str] | None = None) -> int:
                    help="rotate when the per-model weekly %% reaches this (default 95)")
     w.add_argument("--interval", type=int, default=60, help="active-account poll seconds (default 60)")
     w.add_argument("--scan", type=int, default=300, help="all-accounts scan seconds (default 300)")
-    w.add_argument("--cooldown", type=int, default=600, help="min seconds between swaps (default 600)")
+    w.add_argument("--cooldown", type=int, default=300, help="min seconds between swaps (default 300)")
     w.add_argument("--no-rotate", action="store_true", help="dashboard only, never swap")
 
     sub.add_parser("status", help="one-shot usage table for all accounts")
