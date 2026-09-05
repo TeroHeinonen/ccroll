@@ -638,9 +638,10 @@ def swap_identity(cfg: Cfg, target: Account) -> str | None:
     rewrote underneath us is skipped rather than written.
 
     Returns a line for the event log, or None when there was nothing to do."""
-    ident = (read_json(os.path.join(cfg.root, target.name, CONFIG_FILE)) or {}).get("oauthAccount")
-    if not isinstance(ident, dict) or not ident:
-        return f"identity left as-is: no stored oauthAccount for {target.name}"
+    ident = stored_identity(cfg, target.name)
+    if not ident:
+        return (f"identity left as-is: no stored identity for {target.name} — "
+                f"re-run `ccroll add` for it")
     path = cfg.live_config_path
     for _ in range(2):
         before = _mtime_ns(path)
@@ -658,6 +659,34 @@ def swap_identity(cfg: Cfg, target: Account) -> str | None:
         write_json_atomic(path, patched)
         return f"identity synced to {target.name}"
     return "identity left as-is: live config is being written by another session"
+
+
+def stored_identity(cfg: Cfg, email: str) -> dict | None:
+    """The account's own `oauthAccount`, as kept beside its credentials."""
+    ident = (read_json(os.path.join(cfg.root, email, CONFIG_FILE)) or {}).get("oauthAccount")
+    return ident if isinstance(ident, dict) and ident else None
+
+
+def store_identity(cfg: Cfg, email: str, ident: dict | None) -> str | None:
+    """Keep an account's `oauthAccount` next to its credentials.
+
+    `--sync-identity` copies exactly this object into the live config on each
+    swap, so an account registered without it can never have its displayed
+    identity corrected.  A fresh login writes one into its profile; this
+    carries it over.  Only that key is written — anything else the stored
+    config holds is preserved.
+
+    Returns a warning for the caller to print, or None on success."""
+    if not isinstance(ident, dict) or not ident:
+        return ("no identity in this login profile — `/status` will keep naming "
+                "the previous account until it is re-added")
+    blob = read_json(os.path.join(cfg.root, email, CONFIG_FILE))
+    blob = dict(blob) if isinstance(blob, dict) else {}
+    if blob.get("oauthAccount") == ident:
+        return None
+    blob["oauthAccount"] = ident
+    write_json_atomic(os.path.join(cfg.root, email, CONFIG_FILE), blob)
+    return None
 
 
 def harvest(cfg: Cfg, state: dict) -> None:
@@ -1711,8 +1740,15 @@ def cmd_add(cfg: Cfg, a: Ansi) -> int:
                 dest = os.path.join(cfg.root, email)
                 if os.path.isdir(dest):
                     _register(cfg, state, email, creds)
+                    # the temp profile is about to go: keep its identity, or the
+                    # account can never be identity-synced on a swap
+                    warn = store_identity(
+                        cfg, email,
+                        (read_json(os.path.join(tmp, CONFIG_FILE)) or {}).get("oauthAccount"))
                     shutil.rmtree(tmp, ignore_errors=True)
                     print(a.green(f"↻ {email} — credentials updated (account already existed)"))
+                    if warn:
+                        print(a.yellow(f"⚠ {warn}"))
                 else:
                     if not NAME_RE.match(email):
                         shutil.rmtree(tmp, ignore_errors=True)
@@ -1743,10 +1779,23 @@ def cmd_adopt(cfg: Cfg, a: Ansi) -> int:
     if not email:
         raise CcrollError("could not read the live account's email — check network and retry")
     _register(cfg, state, email, live)
+    # the live config names the account that logged in, which after a swap is
+    # not necessarily the one these credentials belong to — copy it only when
+    # the two agree
+    ident = (read_json(cfg.live_config_path) or {}).get("oauthAccount")
+    shown = (ident or {}).get("emailAddress")
+    warn = None
+    if isinstance(ident, dict) and shown and shown != email:
+        warn = (f"live config still names {shown} — identity not stored for {email}; "
+                f"re-run `ccroll add` for it to enable --sync-identity")
+    else:
+        warn = store_identity(cfg, email, ident)
     state["active"] = email
     add_event(state, f"adopted live login: {email}")
     save_state(cfg, state)
     print(a.green(f"✓ live login saved as {email} and marked active"))
+    if warn:
+        print(a.yellow(f"⚠ {warn}"))
     return 0
 
 
