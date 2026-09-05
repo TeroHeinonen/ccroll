@@ -86,6 +86,8 @@ RESCAN_MIN_S = 30               # floor on any scheduled rescan, so a stale rese
 LAST_GOOD_MAX_AGE_S = 15 * 60   # how long a cached usage read stands in for a failed one
 USAGE_ERROR_COOLDOWN_S = 60     # back off this long on an account the endpoint throttles
 PREEMPT_MIN_GAP_S = 15 * 60     # never preempt within this long of any swap
+FRESH_PERISH_RATE = 97 / 168    # %/h an unopened weekly window "loses" by not starting
+                                # its 7-day clock: one full window per week
 FAST_POLL_BELOW_S = 10 * 60     # poll the active account faster once a limit is this close
 FAST_POLL_S = 15
 REFRESH_MARGIN_S = 180          # refresh an access token this close to expiry
@@ -1300,20 +1302,26 @@ def pick_target(usages: dict, cfg: Cfg, exclude: str | None, t: float | None = N
                 preload: dict | None = None) -> str | None:
     """The account whose governing weekly headroom is most perishable.
 
-    Order: accounts whose weekly window is not open come first (spending
-    there is free and starts their clock at once); then, by how fast the
-    remaining headroom is being lost — headroom over hours until reset — so
-    the account that resets soonest with the most unused quota is drained
-    first, and accounts with a distant reset are kept as reserve.  Least
-    loaded is the tie-break, and the key ends in the account name so equal
-    usage always resolves the same way, whatever order the scan returned."""
+    Every account is ranked by one number: how fast its unused headroom is
+    being lost, in % per hour.  For an open window that is headroom over
+    hours until the reset, so the account that resets soonest with the most
+    unused quota is drained first and distant resets are kept as reserve.
+    A window that is not open has no deadline; what it loses by waiting is
+    only the later start of its next week, worth a full window per seven
+    days, so it is valued at FRESH_PERISH_RATE.  That puts it below any
+    account with real quota about to expire and above a nearly spent one
+    with a distant reset — with no special case.  Least loaded is the
+    tie-break, and the key ends in the account name so equal usage always
+    resolves the same way, whatever order the scan returned."""
     t = now() if t is None else t
 
     def key(item):
         name, u = item
         pct, reset = governing_window(u, cfg)
         rate = perish_rate(pct, reset, t)
-        return (rate is not None, -(rate or 0), effective_pct(pct, reset, t),
+        if rate is None:
+            rate = FRESH_PERISH_RATE
+        return (-rate, effective_pct(pct, reset, t),
                 effective_pct(u.session_pct, u.session_reset, t), name)
 
     strict, ok = candidates(usages, cfg, exclude, preload, t)
