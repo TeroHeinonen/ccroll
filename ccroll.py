@@ -80,6 +80,7 @@ REFRESH_BACKOFF_S = 2.0         # first backoff; doubles per attempt
 REFRESH_STAGGER_S = 0.35        # spacing between refreshes of different accounts
 MAX_PARALLEL = 8
 MAX_TARGET_TRIES = 4            # fresh-read confirmations before giving up on a swap
+ROLLED_MARK = "rolled"          # reset column for a window whose reset has passed
 RESCAN_MIN_S = 30               # floor on any scheduled rescan, so a stale reset time
                                 # can never turn the watch loop into a scan storm
 LAST_GOOD_MAX_AGE_S = 15 * 60   # how long a cached usage read stands in for a failed one
@@ -1059,10 +1060,18 @@ def check_auto_continue(cfg: Cfg) -> str | None:
 
 
 # --- rotation policy ------------------------------------------------------------
+def window_rolled(reset: float | None, t: float | None = None) -> bool:
+    """Has this window's reset already passed?  Then whatever percentage the
+    endpoint still reports belongs to a window that no longer exists.
+
+    This is the single predicate behind both the decisions and the display,
+    so the two can never disagree about which windows have rolled."""
+    return bool(reset) and reset <= (now() if t is None else t)
+
+
 def effective_pct(pct: float | None, reset: float | None,
                   t: float | None = None) -> float:
-    """The utilisation to make decisions on, which is 0 once the window has
-    rolled over.
+    """The utilisation to act on, which is 0 once the window has rolled over.
 
     A percentage whose reset time has already passed is stale data: the
     window has reset and the endpoint simply has not caught up (an account
@@ -1073,13 +1082,13 @@ def effective_pct(pct: float | None, reset: float | None,
     85 seconds after its session window reset, while it was the single most
     perishable account in the fleet.
 
-    Display code deliberately does NOT use this: the dashboard should show
-    what the endpoint actually reported."""
+    The dashboard goes through it too, and marks the result as inferred, so
+    what is displayed is what rotation acts on.  The 0 is a deduction rather
+    than a reading, but never an unchecked one: `verified_target` re-reads
+    whichever account it picks before any swap commits."""
     if pct is None:
         return 0.0
-    if reset and reset <= (now() if t is None else t):
-        return 0.0
-    return pct
+    return 0.0 if window_rolled(reset, t) else pct
 
 
 def window_spent(pct: float | None, reset: float | None, threshold: float,
@@ -1496,8 +1505,18 @@ def merged_view(usages: dict, last_good: dict) -> dict:
 
 # --- rendering ------------------------------------------------------------------
 def _pct_cell(a: Ansi, pct, reset):
+    """One utilisation cell: the figure ccroll acts on, then its reset.
+
+    A window whose reset has passed shows the inferred 0% and `↺rolled`
+    rather than the stale reading the endpoint is still serving — dimmed,
+    because it is a deduction awaiting the next read.  That is distinct
+    from `↺—`, a window that was never opened and is genuinely idle."""
     if pct is None:
         return a.dim("—"), 1
+    if window_rolled(reset):
+        plain = f"{effective_pct(pct, reset):.0f}%"
+        return (a.dim(f"{plain:>4}") + a.dim(" ↺") + a.dim(ROLLED_MARK),
+                max(len(plain), 4) + 2 + len(ROLLED_MARK))
     plain = f"{pct:.0f}%"
     dur, dur_len = fmt_dur3(a, (reset - now()) if reset else None)
     return sev_color(a, pct)(f"{plain:>4}") + a.dim(" ↺") + dur, max(len(plain), 4) + 2 + dur_len
@@ -1554,11 +1573,15 @@ def render_burn(a: Ansi, state: dict, name: str, u: Usage | None, scoped_label: 
     for (label, pct, reset), key in zip(windows, keys):
         if pct is None:
             continue
-        # the same conservative rate the rotation rules act on, so the ETA
-        # shown is the ETA ccroll will move on
+        # the same conservative rate and the same utilisation the rotation
+        # rules act on, so the ETA shown is the ETA ccroll will move on and a
+        # rolled-over window reads as the 0% it is being judged as
+        rolled = window_rolled(reset)
+        pct = effective_pct(pct, reset)
         rate, fit_rate, eta, provisional = window_eta(state, name, key, pct)
+        provisional = provisional or rolled
         reset_in = (reset - now()) if reset else None
-        parts = [f"{pct:5.1f}%"]
+        parts = [a.dim(f"{pct:5.1f}%") if rolled else f"{pct:5.1f}%"]
         # fixed-width burn cell ("0000.0%/h") so rows stay aligned as the
         # rate swings from single digits to hundreds or thousands
         if rate is None:
@@ -1582,7 +1605,9 @@ def render_burn(a: Ansi, state: dict, name: str, u: Usage | None, scoped_label: 
         # when the sustained recent slope is what drives the figure, keep the
         # plain fit visible so the smoothing is not a mystery
         note = ""
-        if rate is not None and fit_rate is not None and rate > max(fit_rate, BURN_MIN_RATE) * 1.2:
+        if rolled:
+            note = a.dim("↺ rolled over — 0% inferred, awaiting a fresh read")
+        elif rate is not None and fit_rate is not None and rate > max(fit_rate, BURN_MIN_RATE) * 1.2:
             note = a.dim(f"(fit {fit_rate:.1f}%/h)")
         tail = "  ".join(x for x in (verdict, note) if x)
         lines.append(f"  {label:<14}" + "  ·  ".join(parts) + ("  " + tail if tail else ""))

@@ -14,15 +14,16 @@ ccroll 0.1.0  ·  auto-rotate at session≥95% / fable≥97% or ≤60s from a li
 ─  ────────────────  ────────────────  ────────────────  ────────────────  ───────
 ►  tero@example.com   62% ↺0d 02h 10m   31% ↺3d 02h 40m   45% ↺5d 01h 12m  ok
    dev@example.com   100% ↺0d 00h 55m   88% ↺1d 04h 02m  100% ↺2d 03h 15m  BLOCKED
-   ops@example.com    12% ↺0d 04h 41m    8% ↺6d 01h 33m    9% ↺6d 01h 33m  ok
+   ops@example.com     0% ↺—             0% ↺rolled        0% ↺rolled      ok
+   qa@example.com     12% ↺0d 04h 41m    8% ↺6d 01h 33m    9% ↺6d 01h 33m  ok
 
 burn · tero@example.com
-  session        62.3%  ·  burn   14.2%/h  ·  limit in ≈0d 02h 39m  ·  resets in 0d 02h 10m  ✓ reset first
+  session        62.0%  ·  burn   14.2%/h  ·  limit in ≈0d 02h 40m  ·  resets in 0d 02h 10m  ✓ reset first
   weekly·all     31.0%  ·  burn    1.1%/h  ·  limit in ≈2d 14h 43m  ·  resets in 3d 02h 40m  ⚠ limit first
-  weekly·fable   45.2%  ·  burn    1.9%/h  ·  limit in ≈1d 04h 50m  ·  resets in 5d 01h 12m  ⚠ limit first
+  weekly·fable   45.0%  ·  burn    1.9%/h  ·  limit in ≈1d 04h 56m  ·  resets in 5d 01h 12m  ⚠ limit first
   swap cost ≈ session 24% · fable 10% (n=2)
 
-next in line: ops@example.com  (91% fable headroom expires in 6d 01h 33m · 12% session)
+next in line: ops@example.com  (fable window not open — fresh week starts on use)
 
 events
   21:44:02  → tero@example.com (left dev@example.com: session 97%)
@@ -116,7 +117,7 @@ In simulation against a fleet of 4–11 accounts under steady, back-loaded and b
 
 **When every account is spent**, ccroll doesn't give up: it shows which account recovers first and waits for exactly that moment (the latest reset among that account's binding limits), then rescans and rotates as soon as headroom exists. Only resets still ahead count, and no rescan is ever scheduled less than 30 seconds out — a reset time already in the past names a moment that has happened, and treating it as one to wait for turned the watch loop into a scan of every account every second, which is itself enough to get the usage endpoint to throttle you. The banner clears as soon as a fallback has headroom again, rather than lingering as a description of a state that has passed.
 
-**Stale readings don't strand an account.** A percentage whose reset time has already passed is the endpoint lagging behind a window that has rolled over — an account reported at 100% with an expired reset reads 0% a minute later. So every rule that weighs a percentage against a threshold ignores that window rather than counting the account as spent: the exhaustion test, the candidate filter, the burn-based early rotation, the recovery estimate and the utilisation reported to other sessions all read it as free, and the fresh read before every swap keeps the choice honest. Getting this right in only some of those places is worse than nowhere, because an account can then be judged not-spent and simultaneously not-good-enough, which is how the most perishable account in a fleet ends up passed over 85 seconds after its window reset. Display is the deliberate exception: the table shows what the endpoint actually reported.
+**Stale readings don't strand an account.** A percentage whose reset time has already passed is the endpoint lagging behind a window that has rolled over — an account reported at 100% with an expired reset reads 0% a minute later. So every rule that weighs a percentage against a threshold ignores that window rather than counting the account as spent: the exhaustion test, the candidate filter, the burn-based early rotation, the recovery estimate and the utilisation reported to other sessions all read it as free, and the fresh read before every swap keeps the choice honest. Getting this right in only some of those places is worse than nowhere, because an account can then be judged not-spent and simultaneously not-good-enough, which is how the most perishable account in a fleet ends up passed over 85 seconds after its window reset. The dashboard reads the same way, so what you see is what rotation is acting on; a rolled-over window shows its inferred 0% dimmed, under `↺rolled`, rather than the figure the endpoint is still serving.
 
 **A failed read doesn't freeze rotation either.** Missing data still never rotates, with one exception: when the *active* account's own usage read fails, which is exactly what an account being throttled does, ccroll falls back to its last error-free snapshot if that is under 15 minutes old and its window has not since reset. A window's percentage only rises until it resets, so a recent "this account is spent" reading is still sound, and the alternative is a live session pinned to an account nobody can see. The rotation reason then names the staleness and the underlying read error. An account the endpoint throttles is left alone for a minute rather than retried on every poll, and keeps showing its last good numbers with the error noted in the Status column instead of a blank row.
 
@@ -125,6 +126,8 @@ Tuning: `--threshold`, `--scoped-threshold`, `--lead` (seconds of burn-predicted
 ## Burn estimates
 
 Every duration — resets, limit ETAs, token expiries — is shown in a fixed `0d 00h 00m` format with days, hours and minutes each in their own color (zero-value leading units dimmed), so remaining time reads in a single glance.
+
+Two reset cells read as words rather than a duration, and they mean different things. `↺—` is a window that was never opened: it sits at 0% and nothing is expiring. `↺rolled` is a window whose reset has already passed while the usage endpoint is still serving the old figure — the row shows the 0% ccroll is acting on rather than that stale reading, dimmed, because it is a deduction awaiting the next read rather than a measurement. It is never an unchecked one: whichever account gets picked is re-read in full before a swap commits. The account in the sample above is next in line precisely because of it.
 
 The dashboard samples the active account's three windows (session / weekly-all / weekly-scoped) every `--interval` — every 15 s once a limit is within ten minutes — and fits a least-squares slope over the last 45 minutes. The burn rate shown (%/h) and the time-to-limit derived from it are the same pessimistic estimate the rotation rules act on (the larger of that fit and the sustained recent slope; when the two differ by more than a fifth the plain fit is shown alongside in dim text), so the dashboard never says 20 minutes while ccroll acts on 7. It also shows the time until each window resets — and which comes first (`✓ reset first` / `⚠ limit first`). A window reset clears its series automatically, and so does a swap: the series starts again at the new account, skipping the grace period, because samples from before either say nothing about how this account burns now. A first estimate therefore appears about two minutes after the grace ends (three samples) and is shown dimmed until the fit covers 8 minutes; a session can burn out in 10 minutes, so an early rough number beats none.
 
