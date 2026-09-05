@@ -918,6 +918,76 @@ def fleet_forecast(state: dict, name: str, u: Usage, cfg: Cfg, n_accounts: int) 
             "preload_measured": measured, "provisional": provisional, "accounts": n_accounts}
 
 
+def fleet_runway(fc: dict, usages: dict, cfg: Cfg, t: float | None = None) -> dict | None:
+    """How long the current burn can go on before the whole fleet is spent:
+    the complement of the forecast's rate comparison.  The forecast says
+    whether this level of parallelism fits the accounts in steady state;
+    the runway says how many hours of it are left right now.
+
+    Per weekly window the demand rate is the forecast's own work plus
+    handover, per hour, so the two lines always agree.  Supply starts as
+    the headroom that exists now — every readable account's threshold minus
+    its effective utilisation, so a rolled-over or unopened window counts
+    in full — and grows at each known reset, in time order, by the share
+    that account had used: if the demand has not drained the supply by the
+    time a reset arrives, that account refreshes and the count goes on;
+    the first reset the demand beats is where the fleet runs dry.  Beyond
+    the last known reset nothing more is known, so a runway that outlasts
+    it is reported as "beyond" that horizon rather than as a number; and
+    when the steady-state load is at or under 100% the fleet replenishes
+    faster than it drains, which is "sustained".
+
+    Session windows are deliberately left out.  They bind the rate of a
+    single account, not the fleet's total: readable accounts times one
+    session every five hours is far more than any plausible burn draws, so
+    only the weekly windows can run the fleet dry."""
+    t = now() if t is None else t
+    accts = [(n, u) for n, u in usages.items()
+             if n != LIVE_PSEUDO and u and not u.error and u.session_pct is not None]
+    if not accts:
+        return None
+    out = {"windows": {}}
+    for w in fc["windows"]:
+        if w.get("rate") is None:
+            continue
+        key = w["key"]
+        thr = 99.5 if key == "weekly" else cfg.scoped_threshold
+        demand = (w["work"] + w["handover"]) / WEEK_H          # %/h on this window
+        supply, resets = 0.0, []
+        for _, u in accts:
+            pct, reset = (u.weekly_pct, u.weekly_reset) if key == "weekly" else (u.scoped_pct, u.scoped_reset)
+            used = effective_pct(pct, reset, t)
+            supply += max(0.0, thr - used)
+            if reset and reset > t:
+                resets.append(((reset - t) / 3600.0, used))
+        now_h = supply
+        resets.sort()
+        res = {"now": now_h, "refreshed": 0.0, "hours": float("inf"), "beyond": False,
+               "horizon_h": resets[-1][0] if resets else 0.0, "sustained": False, "demand": demand}
+        if demand <= 0:
+            res["sustained"] = True
+            out["windows"][key] = res
+            continue
+        exhausted = False
+        for r_h, used in resets:
+            if demand * r_h >= supply:
+                exhausted = True
+                break
+            supply += used
+        res["hours"] = supply / demand
+        res["refreshed"] = supply - now_h
+        if not exhausted and resets and res["hours"] > res["horizon_h"]:
+            res["beyond"] = True
+            res["sustained"] = w["load"] <= 1.0
+        out["windows"][key] = res
+    if not out["windows"]:
+        return None
+    binds = min(out["windows"], key=lambda k: out["windows"][k]["hours"])
+    out.update(out["windows"][binds])
+    out["binds"] = binds
+    return out
+
+
 # --- account-switch signals -----------------------------------------------------
 # A tiny protocol other Claude Code sessions on this machine tail so they can
 # hold off spawning expensive work moments before a swap, and relaunch cheaply
@@ -1714,22 +1784,25 @@ def render_burn(a: Ansi, state: dict, name: str, u: Usage | None, scoped_label: 
     est = preload_estimate(state)
     if est:
         bits = []
+        # one decimal: the fleet forecast's handover term uses the unrounded
+        # median, and "7%" next to a figure computed from 7.4% reads as wrong
         if est.get("session") is not None:
-            bits.append(f"session {est['session']:.0f}%")
+            bits.append(f"session {est['session']:.1f}%")
         if est.get("scoped") is not None:
-            bits.append(f"{scoped_label.lower()} {est['scoped']:.0f}%")
+            bits.append(f"{scoped_label.lower()} {est['scoped']:.1f}%")
         elif est.get("weekly") is not None:
-            bits.append(f"weekly {est['weekly']:.0f}%")
+            bits.append(f"weekly {est['weekly']:.1f}%")
         lines.append(a.dim("  swap cost ≈ " + " · ".join(bits) + f" (n={est['n']})"))
     return lines
 
 
 def render_fleet(a: Ansi, state: dict, name: str, u: Usage | None, cfg: Cfg,
-                 n_accounts: int, scoped_label: str) -> list[str]:
+                 n_accounts: int, scoped_label: str, usages: dict | None = None) -> list[str]:
     """The fleet forecast block: per weekly window, the load the current burn
     would put on the whole fleet around the clock, and the handover share
     of that demand — the figure that says whether there are too many lanes
-    for the accounts."""
+    for the accounts.  With the fleet's usages to hand it ends with the
+    runway: how long this burn can carry on before every account is spent."""
     if not u or u.error:
         return []
     head = a.bold(f"fleet · {n_accounts} accounts · if this burn ran around the clock")
@@ -1759,7 +1832,31 @@ def render_fleet(a: Ansi, state: dict, name: str, u: Usage | None, cfg: Cfg,
                            f"  ·  {fc['swaps_per_day']:.1f} swaps/day"))
     else:
         lines.append(a.dim("  burn is idle on every window — no swaps at this rate"))
+    if usages is not None:
+        rw = fleet_runway(fc, usages, cfg)
+        if rw:
+            lines.append(render_runway(a, rw, fc, scoped_label))
     return lines
+
+
+def render_runway(a: Ansi, rw: dict, fc: dict, scoped_label: str) -> str:
+    """One line: the fleet runway, which window binds, and what it is made of."""
+    wname = f"{scoped_label.lower()}" if rw["binds"] == "scoped" else "weekly·all"
+    stock = f"{rw['now']:.0f}% now"
+    if rw["refreshed"] > 0:
+        stock += f" + {rw['refreshed']:.0f}% refreshed before then"
+    tail = "" if fc["preload_measured"] else "  ·  work only, swap cost not measured yet"
+    if rw["sustained"]:
+        text = f"  runway: sustained at this burn  ·  {wname} load ≤ 100%  ·  {stock}{tail}"
+        return a.dim(text) if fc["provisional"] else a.green(text)
+    if rw["beyond"]:
+        text = (f"  runway > {fmt_dur(rw['horizon_h'] * 3600)} at this burn — beyond the resets we know"
+                f"  ·  {wname} binds  ·  {stock}{tail}")
+        return a.dim(text) if fc["provisional"] else text
+    text = f"  runway ≈ {fmt_dur(rw['hours'] * 3600)} at this burn  ·  {wname} binds  ·  {stock}{tail}"
+    if fc["provisional"]:
+        return a.dim(text)
+    return a.red(text) if rw["hours"] < 24 else text
 
 
 # --- scanning -------------------------------------------------------------------
@@ -1917,7 +2014,7 @@ def cmd_status(cfg: Cfg, a: Ansi) -> int:
             print(line)
         print()
         for line in render_fleet(a, state, active, usages[active], cfg,
-                                 readable_accounts(accounts, usages), label):
+                                 readable_accounts(accounts, usages), label, usages=usages):
             print(line)
     target = pick_target(usages, cfg, exclude=active, preload=preload_estimate(state))
     if target:
@@ -2109,7 +2206,7 @@ def cmd_watch(cfg: Cfg, a: Ansi) -> int:
                         if near else f"limit under {FAST_POLL_BELOW_S // 60} min away")
                 lines.append(a.yellow(f"  ⚠ {what} — polling every {FAST_POLL_S} s"))
             lines += [""] + render_fleet(a, state, active, usages[active], cfg,
-                                         readable_accounts(accounts, usages), label)
+                                         readable_accounts(accounts, usages), label, usages=usages)
         target = pick_target(usages, cfg, exclude=active, preload=preload_estimate(state))
         if target:
             lines += ["", a.dim("next in line: ") + a.green(target)
