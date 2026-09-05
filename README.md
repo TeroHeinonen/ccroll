@@ -5,10 +5,10 @@
 You're deep into an interactive Claude Code session: hours of context, subagents running, a compaction or two behind you. Then the 5-hour window (or the weekly limit) runs out. Restarting under another account kills your subagents and costs you the re-fill of the whole context anyway. Hitting token limits kills all your subtasks requiring restart and scanning the status. This restart can
 take 25% of your session token quota. And switching by hand — `/login`, browser, login rituals — breaks your flow a dozen times a week (or per day if you fan out your work).
 
-ccroll removes the chore. It runs in its own terminal as a live dashboard over all of your accounts, estimates when the active one will hit its limits, and **hot-swaps the live credentials to the account with the most headroom** — while your session keeps running, untouched.
+ccroll removes the chore. It runs in its own terminal as a live dashboard over all of your accounts, estimates when the active one will hit its limits, and **hot-swaps the live credentials to the account whose unused quota would otherwise expire first** — while your session keeps running, untouched.
 
 ```
-ccroll 0.1.0  ·  auto-rotate at session≥95% / fable≥97%  ·  22:04:31
+ccroll 0.1.0  ·  auto-rotate at session≥95% / fable≥97% or ≤180s from a limit · early to next reset when runway>3h  ·  22:04:31
 
    Account            Session (5h)      Weekly · all      Weekly · Fable    Status
 ─  ─────────────────  ────────────────  ────────────────  ────────────────  ──────
@@ -21,7 +21,7 @@ burn · tero@example.com
   weekly·all     31.0%  ·  burn    1.1%/h  ·  limit in ≈2d 14h 40m  ·  resets in 3d 02h 40m  ✓ reset first
   weekly·fable   45.2%  ·  burn    1.9%/h  ·  limit in ≈1d 04h 12m  ·  resets in 5d 01h 12m  ⚠ limit first
 
-next in line: ops@example.com
+next in line: ops@example.com  (91% fable headroom expires in 0d 06h 33m · 12% session)
 
 events
   12:10  → tero@example.com (session 91%)
@@ -89,19 +89,28 @@ Global flags: `--root` (account store, default `~/.claude-accounts`), `--claude-
 
 ccroll rotates away from the active account when any of these hold:
 
-- session (5-hour) usage ≥ `--threshold` (default **90%**) — proactive, so you never see the "limit reached" banner;
+- session (5-hour) usage ≥ `--threshold` (default **95%**) — proactive, so you never see the "limit reached" banner;
 - the governing weekly limit is (nearly) spent;
+- **the burn says a limit is closer than `--lead` seconds** (default 180, or three poll intervals if that is longer) — on any window: session, the governing weekly limit, or weekly-all;
 - the API reports the account as blocked.
 
-**Which weekly limit governs is a flag.** Plans with a per-model weekly limit (e.g. the Fable limit on current Max plans) usually hit *that* wall first, so `--by scoped` (the default) treats it as the constraint and picks the next account by most scoped headroom. If you don't care about the per-model limit — or your plan has none — use `--by weekly` to govern by the all-models weekly limit instead.
+**Static thresholds are the latest point, not the trigger.** With a fan-out of subagents an account can burn 150%/h of its session window: 95% → 100% takes two minutes, which is about one poll plus one swap — too late, and every request in flight dies with a 429. So ccroll predicts the time to each limit from the burn estimate and rotates once that prediction drops under the lead time, however far from the static threshold the account still is. The estimate is deliberately pessimistic: the larger of the 45-minute least-squares slope and the slope of the last two samples, so a burst that started a minute ago is caught before the fit catches up. Once a limit is under ten minutes away the active account is polled every 15 s instead of every `--interval`. No burn estimate (first two minutes after a swap) means the static thresholds alone apply; ccroll never rotates on missing data.
 
-The next account is chosen by most headroom on the governing limit (with hysteresis: an account must be comfortably clear of the thresholds to qualify), and ties break on account name so the same fleet always resolves the same way. The choice is then confirmed against a fresh read of that account before the swap commits, because fleet data can be up to one scan old and an account may have been consumed on another machine meanwhile. ccroll never swaps onto an account that is already spent.
+**Which weekly limit governs is a flag.** Plans with a per-model weekly limit (e.g. the Fable limit on current Max plans) usually hit *that* wall first, so `--by scoped` (the default) treats it as the constraint and picks the next account by that window. If you don't care about the per-model limit — or your plan has none — use `--by weekly` to govern by the all-models weekly limit instead.
+
+**The next account is the one whose unused quota is about to go to waste.** Weekly windows roll: a window opens on an account's first use and resets a week later, and whatever headroom is still unused at that moment simply vanishes. So spending from an account that resets in six hours costs nothing in the long run, while spending from one that resets in six days eats into reserve for six days. ccroll therefore ranks candidates by how fast their remaining headroom on the governing window is being lost — headroom divided by hours until reset — and drains the fastest-perishing one first, keeping accounts with distant resets as reserve. Accounts whose weekly window is not open at all (just reset, not yet touched) come first of all: using them is free too, and it starts their next week's clock immediately rather than later.
+
+Candidates must be comfortably clear of the thresholds to qualify (hysteresis), least-loaded is the tie-break, and ties then break on account name so the same fleet always resolves the same way. The choice is confirmed against a fresh read of that account before the swap commits, because fleet data can be up to one scan old and an account may have been consumed on another machine meanwhile. ccroll never swaps onto an account that is already spent.
+
+In simulation against a fleet of 4–11 accounts under steady, back-loaded and bursty demand near weekly capacity, this ordering cut blocked time by roughly 2–4× compared with picking the least-loaded account, at the same swap rate. Pure "earliest reset first" is not enough on its own: it leaves freshly reset accounts untouched (their reset is undefined), which delays their next week and loses capacity.
+
+**When the weekly window is the bottleneck, ccroll also moves early.** If the fleet is Fable-bound rather than session-bound, the account to *sit on* is the one whose Fable window resets next: its unused headroom is the first to vanish, and being on it at the moment it resets reopens its next week with no idle gap. So while the active account still has headroom, ccroll moves to the account with the earliest reset among the comfortable candidates. Reset times never move once a window is open, so this target is stable and cannot flap. The move is gated on runway: it only happens while the active account's predicted time to any limit exceeds `--preempt-runway` (default 3 h), which keeps it off entirely while sessions are the constraint (there a pre-emptive swap would only add a cache re-prime). In simulation of a Fable-bound fleet at weekly capacity this cut blocked time roughly 2–3× (steady 3.6% → 1.2%, bursty 4.5% → 0.4%) for about one extra swap a day. `--no-preempt` restores rotate-only-when-spent. `--touch` goes one step further and also opens freshly reset windows at once (one request there, then on to the next-reset account); that adds another ~1.5 swaps a day and only pays when a swap costs no more than about 1% of the weekly window, so it is opt-in.
 
 **There is no swap cooldown**, and none is needed. A swap requires the account you are leaving to be spent and the one you are moving to not to be; usage within a window only rises, and only the active account consumes. Returning to an earlier account therefore requires that account's window to have reset, which is recovery rather than flapping. Set `--cooldown` if you want one anyway.
 
 **When every account is spent**, ccroll doesn't give up: it shows which account recovers first and waits for exactly that moment (the latest reset among that account's binding limits), then rescans and rotates as soon as headroom exists.
 
-Tuning: `--threshold`, `--scoped-threshold`, `--interval` (active-account poll, default 60 s), `--scan` (full-fleet scan, default 300 s), `--cooldown`, `--no-rotate` (observe only).
+Tuning: `--threshold`, `--scoped-threshold`, `--lead` (seconds of burn-predicted headroom at which to rotate early, default 180), `--interval` (active-account poll, default 60 s), `--scan` (full-fleet scan, default 300 s), `--preempt-runway` (hours, default 3), `--no-preempt`, `--touch`, `--cooldown`, `--no-rotate` (observe only).
 
 ## Burn estimates
 

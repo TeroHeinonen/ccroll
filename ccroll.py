@@ -17,8 +17,8 @@ screen is always the identity that is actually live.  `ccroll watch` runs a
 live dashboard in its own terminal:
 it polls every account's usage through the free OAuth usage endpoint,
 highlights the active account, estimates burn rates and time-to-limit from a
-rolling time series, and hot-swaps to the account with the most headroom when
-the active one approaches a limit.
+rolling time series, and hot-swaps to the account whose weekly headroom would
+otherwise expire soonest when the active one approaches a limit.
 
 Stdlib only.  Linux (and any platform where Claude Code keeps credentials in
 a plain file rather than a keychain).
@@ -76,6 +76,9 @@ REFRESH_BACKOFF_S = 2.0         # first backoff; doubles per attempt
 REFRESH_STAGGER_S = 0.35        # spacing between refreshes of different accounts
 MAX_PARALLEL = 8
 MAX_TARGET_TRIES = 4            # fresh-read confirmations before giving up on a swap
+PREEMPT_MIN_GAP_S = 15 * 60     # never preempt within this long of any swap
+FAST_POLL_BELOW_S = 10 * 60     # poll the active account faster once a limit is this close
+FAST_POLL_S = 15
 REFRESH_MARGIN_S = 180          # refresh an access token this close to expiry
 SWAP_VERIFY_DELAY_S = 2.0       # re-check the live file this long after a swap
 SAMPLE_RETENTION_S = 24 * 3600  # keep at most a day of burn-rate samples
@@ -252,6 +255,19 @@ class Cfg:
         self.scan = max(self.interval, int(getattr(args, "scan", 300)))
         self.cooldown = int(getattr(args, "cooldown", 0))
         self.rotate = not getattr(args, "no_rotate", False)
+        # burn-based early rotation: the active account counts as spent once
+        # its predicted time to a limit drops under this (the static thresholds
+        # stay as the latest point).  Covers the poll interval, usage-endpoint
+        # lag, the swap itself and requests already in flight.
+        lead = getattr(args, "lead", None)
+        self.lead = float(lead) if lead is not None else float(max(180, 3 * self.interval))
+        # pre-emptive rotation: while the active account still has headroom,
+        # move to the account whose governing weekly window resets soonest
+        # (and, with --touch, open freshly reset windows at once).  Gated on
+        # the active account's runway so it never fires when sessions bind.
+        self.preempt = not getattr(args, "no_preempt", False)
+        self.preempt_runway = float(getattr(args, "preempt_runway", 3.0)) * 3600
+        self.touch = bool(getattr(args, "touch", False))
         # which weekly limit governs exhaustion + next-account choice:
         # "scoped" = the per-model weekly limit (Fable on current Max plans),
         # "weekly" = the all-models weekly limit.
@@ -589,26 +605,187 @@ def is_exhausted(u: Usage | None, cfg: Cfg) -> str | None:
     return None
 
 
-def pick_target(usages: dict, cfg: Cfg, exclude: str | None) -> str | None:
-    """Least-loaded account that is not spent.  The sort key ends in the account
-    name so equal usage always resolves the same way, whatever order the scan
-    returned."""
+def active_burn(state: dict, name: str, key: str) -> float | None:
+    """Conservative burn estimate for one window of the active account, %/h:
+    the larger of the least-squares slope and the slope of the last two
+    samples, so a burst that just started is caught even though the 45-minute
+    fit lags.  None until there is a fit at all."""
+    series = state.get("samples", {}).get(name, {}).get(key, [])
+    fit = burn_fit(series)
+    if fit is None:
+        return None
+    rate = fit[0]
+    if len(series) >= 2:
+        (t0, p0), (t1, p1) = series[-2], series[-1]
+        if t1 > t0:
+            rate = max(rate, (p1 - p0) / (t1 - t0) * 3600)
+    return rate
+
+
+def _fmt_eta_short(secs: float) -> str:
+    return "<1m" if secs < 60 else f"{secs / 60:.0f}m"
+
+
+def about_to_exhaust(state: dict, name: str, u: Usage | None, cfg: Cfg) -> str | None:
+    """Burn-based early exhaustion for the active account: the reason it is
+    about to hit a limit within cfg.lead seconds at its current burn, or None.
+    Only the active account has a burn series; missing data never rotates."""
+    if u is None or u.error or not name or name == LIVE_PSEUDO:
+        return None
+    windows = [("session", "session", u.session_pct), ("weekly", "weekly", u.weekly_pct)]
+    if cfg.mode == "scoped":
+        windows.append(("scoped", (u.scoped_label or "scoped").lower() + " weekly", u.scoped_pct))
+    for key, label, pct in windows:
+        if pct is None:
+            continue
+        rate = active_burn(state, name, key)
+        eta = eta_to_limit(pct, rate)
+        if eta is not None and eta <= cfg.lead:
+            return f"{label} {pct:.0f}% · ≈{_fmt_eta_short(eta)} to limit at {rate:.0f}%/h"
+    return None
+
+
+def governing_window(u: Usage, cfg: Cfg) -> tuple[float | None, float | None]:
+    """(pct, reset) of the weekly window that governs rotation in this mode."""
+    if cfg.mode == "weekly":
+        return u.weekly_pct, u.weekly_reset
+    return u.scoped_pct, u.scoped_reset
+
+
+def perish_rate(pct: float | None, reset: float | None, t: float | None = None) -> float | None:
+    """How fast the unused part of a weekly window is being lost, in %/h.
+
+    Weekly windows roll: they open on first use and reset a week later, so
+    whatever headroom is still unused at the reset simply vanishes.  Spending
+    from an account whose reset is near costs nothing in the long run, while
+    spending from one that resets in six days eats reserve for six days.
+
+    None means the window is not open (no reset pending, or a stale reset in
+    the past): the account is fresh, and using it costs nothing either — it
+    only starts the next week's clock, which the sooner the better."""
+    t = now() if t is None else t
+    if not reset or reset <= t:
+        return None
+    hours = max((reset - t) / 3600.0, 1.0 / 60)
+    return (100.0 - (pct or 0)) / hours
+
+
+def pick_target(usages: dict, cfg: Cfg, exclude: str | None, t: float | None = None) -> str | None:
+    """The account whose governing weekly headroom is most perishable.
+
+    Order: accounts whose weekly window is not open come first (spending
+    there is free and starts their clock at once); then, by how fast the
+    remaining headroom is being lost — headroom over hours until reset — so
+    the account that resets soonest with the most unused quota is drained
+    first, and accounts with a distant reset are kept as reserve.  Least
+    loaded is the tie-break, and the key ends in the account name so equal
+    usage always resolves the same way, whatever order the scan returned."""
+    t = now() if t is None else t
+
     def key(item):
         name, u = item
-        if cfg.mode == "weekly":
-            return (u.weekly_pct or 0, u.session_pct or 0, u.scoped_pct or 0, name)
-        return (u.scoped_pct or 0, u.session_pct or 0, u.weekly_pct or 0, name)
+        pct, reset = governing_window(u, cfg)
+        rate = perish_rate(pct, reset, t)
+        return (rate is not None, -(rate or 0), pct or 0, u.session_pct or 0, name)
 
+    strict, ok = candidates(usages, cfg, exclude)
+    pool = strict or ok
+    return min(pool, key=key)[0] if pool else None
+
+
+def candidates(usages: dict, cfg: Cfg, exclude: str | None) -> tuple[list, list]:
+    """(strict, ok): accounts that could take over.  `ok` is anyone not spent;
+    `strict` is the subset comfortably clear of every threshold (hysteresis)."""
     ok = [(n, u) for n, u in usages.items()
           if n != exclude and n != LIVE_PSEUDO
           and u and not u.error and u.session_pct is not None
           and not is_exhausted(u, cfg)]
-    strict = [(n, u) for n, u in ok
-              if (u.session_pct or 0) < cfg.threshold - 15
-              and (u.weekly_pct or 0) < 95
-              and (cfg.mode != "scoped" or (u.scoped_pct or 0) < 90)]
-    pool = strict or ok
-    return min(pool, key=key)[0] if pool else None
+    strict = [(n, u) for n, u in ok if comfortable(u, cfg)]
+    return strict, ok
+
+
+def comfortable(u: Usage, cfg: Cfg) -> bool:
+    return ((u.session_pct or 0) < cfg.threshold - 15
+            and (u.weekly_pct or 0) < 95
+            and (cfg.mode != "scoped" or (u.scoped_pct or 0) < 90))
+
+
+def runway_s(state: dict, name: str, u: Usage, cfg: Cfg) -> float | None:
+    """Seconds until the active account is expected to hit a limit at its
+    current burn, across every window that can trigger rotation.  None when
+    there is no burn estimate yet; inf when the burn is negligible."""
+    windows = [("session", u.session_pct), ("weekly", u.weekly_pct)]
+    if cfg.mode == "scoped":
+        windows.append(("scoped", u.scoped_pct))
+    etas, fitted = [], False
+    for key, pct in windows:
+        if pct is None:
+            continue
+        rate = active_burn(state, name, key)
+        if rate is None:
+            continue
+        fitted = True
+        eta = eta_to_limit(pct, rate)
+        if eta is not None:
+            etas.append(eta)
+    if not fitted:
+        return None
+    return min(etas) if etas else float("inf")
+
+
+def preempt_target(cfg: Cfg, state: dict, usages: dict, active: str,
+                   t: float | None = None) -> tuple[str, str] | None:
+    """A better account to be on *before* the active one is spent, or None.
+
+    In a Fable-bound fleet the account to sit on is the one whose governing
+    window resets next: its unused headroom is the first to vanish, and being
+    on it when it resets reopens its next week with no idle gap.  Reset times
+    never move once a window is open, so this target is stable — no flapping.
+    With --touch, an account whose window is not open at all is taken first,
+    for one request, so its next week starts now rather than hours later.
+
+    Gates: a burn estimate must exist and give the active account more than
+    --preempt-runway of headroom (when sessions bind, runway is short and a
+    pre-emptive swap would only add a cache re-prime); the active window must
+    be open (a touch or reset is still taking effect); and no swap in the
+    last PREEMPT_MIN_GAP_S."""
+    t = now() if t is None else t
+    u = usages.get(active)
+    if u is None or u.error or active == LIVE_PSEUDO:
+        return None
+    if t - state.get("last_swap", 0) < PREEMPT_MIN_GAP_S:
+        return None
+    a_pct, a_reset = governing_window(u, cfg)
+    if perish_rate(a_pct, a_reset, t) is None:
+        return None                      # our own window is not open yet
+    runway = runway_s(state, active, u, cfg)
+    if runway is None or runway <= cfg.preempt_runway:
+        return None
+    strict, _ = candidates(usages, cfg, exclude=active)
+    label = scoped_label_of(usages).lower() if cfg.mode == "scoped" else "weekly"
+    if cfg.touch:
+        fresh = [n for n, c in strict if perish_rate(*governing_window(c, cfg), t) is None]
+        if fresh:
+            return min(fresh), f"opens a fresh {label} week"
+    opened = [(governing_window(c, cfg)[1], n) for n, c in strict
+              if perish_rate(*governing_window(c, cfg), t) is not None]
+    if not opened:
+        return None
+    reset, name = min(opened)
+    if reset >= a_reset:
+        return None
+    return name, f"{label} resets {fmt_dur(a_reset - reset)} sooner, in {fmt_dur(reset - t)}"
+
+
+def target_reason(u: Usage, cfg: Cfg, label: str) -> str:
+    """Why this account is next, for the dashboard."""
+    pct, reset = governing_window(u, cfg)
+    name = "weekly" if cfg.mode == "weekly" else label.lower()
+    rate = perish_rate(pct, reset)
+    if rate is None:
+        return f"{name} window not open — fresh week starts on use"
+    return (f"{100 - (pct or 0):.0f}% {name} headroom expires in {fmt_dur(reset - now())} "
+            f"· {u.session_pct or 0:.0f}% session")
 
 
 def verified_target(cfg: Cfg, usages: dict, active: str | None) -> str | None:
@@ -891,8 +1068,7 @@ def cmd_status(cfg: Cfg, a: Ansi) -> int:
     if target:
         u = usages[target]
         print()
-        print(a.green(f"→ best fallback: {target} "
-                      f"({u.session_pct or 0:.0f}% session, {u.scoped_pct or 0:.0f}% {label.lower()})"))
+        print(a.green(f"→ best fallback: {target} ({target_reason(u, cfg, label)})"))
     elif accounts:
         recovery = earliest_recovery(usages, cfg)
         if recovery:
@@ -930,7 +1106,18 @@ def cmd_watch(cfg: Cfg, a: Ansi) -> int:
         record_samples(state, usages)
         save_state(cfg, state)
         next_scan = now() + cfg.scan
-        next_active_poll = now() + cfg.interval
+        next_active_poll = now() + poll_interval()
+
+    def poll_interval() -> float:
+        """Poll the active account every 15 s while a limit is under ten
+        minutes away at the current burn, else at --interval."""
+        name = state.get("active")
+        u = usages.get(name) if name else None
+        if u and not u.error:
+            r = runway_s(state, name, u, cfg)
+            if r is not None and r < FAST_POLL_BELOW_S:
+                return FAST_POLL_S
+        return cfg.interval
 
     def poll_active():
         nonlocal next_active_poll
@@ -941,7 +1128,7 @@ def cmd_watch(cfg: Cfg, a: Ansi) -> int:
             if name:
                 record_samples(state, {name: usages[key]})
                 save_state(cfg, state)
-        next_active_poll = now() + cfg.interval
+        next_active_poll = now() + poll_interval()
 
     def maybe_rotate():
         nonlocal notice, next_scan
@@ -950,8 +1137,11 @@ def cmd_watch(cfg: Cfg, a: Ansi) -> int:
         if now() - state.get("last_swap", 0) < cfg.cooldown:
             return
         active = state["active"]
-        reason = is_exhausted(usages.get(active), cfg)
+        reason = (is_exhausted(usages.get(active), cfg)
+                  or about_to_exhaust(state, active, usages.get(active), cfg))
         if not reason:
+            if cfg.preempt:
+                maybe_preempt(active)
             return
         target = verified_target(cfg, usages, active)
         if not target:
@@ -976,21 +1166,56 @@ def cmd_watch(cfg: Cfg, a: Ansi) -> int:
             add_event(state, notice)
             save_state(cfg, state)
 
+    def maybe_preempt(active: str):
+        """Pre-emptive move while the active account still has headroom; the
+        target is confirmed with a fresh read like any other swap."""
+        nonlocal notice
+        choice = preempt_target(cfg, state, usages, active)
+        if not choice:
+            return
+        target, why = choice
+        fresh = usage_for(get_account(cfg, target).cred_path)
+        if fresh.error:
+            return
+        usages[target] = fresh
+        if is_exhausted(fresh, cfg) or not comfortable(fresh, cfg):
+            return
+        if preempt_target(cfg, state, usages, active) != choice:
+            return                        # the fresh read changed the picture
+        try:
+            detail = do_swap(cfg, state, get_account(cfg, target), why)
+            monitor.note_own_write()
+            notice = f"moved early to {target} ({detail})"
+            poll_active()
+        except CcrollError as e:
+            notice = f"rotation failed: {e}"
+            add_event(state, notice)
+            save_state(cfg, state)
+
     def render() -> str:
         label = scoped_label_of(usages)
         active = state.get("active")
         govern = (f"{label.lower()}≥{cfg.scoped_threshold:.0f}%" if cfg.mode == "scoped"
                   else "weekly·all≥99%")
+        early = (f" · early to next reset when runway>{cfg.preempt_runway / 3600:g}h"
+                 + (" +touch" if cfg.touch else "")) if cfg.preempt else ""
         mode = (a.red("rotation PAUSED") if paused
-                else a.green(f"auto-rotate at session≥{cfg.threshold:.0f}% / {govern}"))
+                else a.green(f"auto-rotate at session≥{cfg.threshold:.0f}% / {govern} "
+                             f"or ≤{cfg.lead:.0f}s from a limit{early}"))
         head = a.bold(f"ccroll {CCROLL_VERSION}") + a.dim("  ·  ") + mode + a.dim("  ·  ") + fmt_clock(now())
         lines = [head, ""]
         lines += render_table(a, build_rows(cfg, state, accounts, usages), label)
         if active and usages.get(active):
             lines += [""] + render_burn(a, state, active, usages[active], label)
+            soon = about_to_exhaust(state, active, usages[active], cfg)
+            if soon:
+                lines.append(a.red(f"  ⚠ rotating early: {soon}"))
+            elif poll_interval() != cfg.interval:
+                lines.append(a.yellow(f"  ⚠ limit under {FAST_POLL_BELOW_S // 60} min away — polling every {FAST_POLL_S} s"))
         target = pick_target(usages, cfg, exclude=active)
         if target:
-            lines += ["", a.dim("next in line: ") + a.green(target)]
+            lines += ["", a.dim("next in line: ") + a.green(target)
+                      + a.dim(f"  ({target_reason(usages[target], cfg, label)})")]
         if notice:
             lines += ["", a.yellow(notice)]
         events = state.get("events", [])[-4:]
@@ -1204,11 +1429,24 @@ def main(argv: list[str] | None = None) -> int:
     w.add_argument("--scoped-threshold", type=float, default=97,
                    help="rotate when the per-model weekly %% reaches this (default 97)")
     w.add_argument("--interval", type=int, default=60, help="active-account poll seconds (default 60)")
+    w.add_argument("--lead", type=float, default=None, metavar="SECONDS",
+                   help="rotate early once the active account's predicted time to any limit at its "
+                        "current burn drops under this (default max(180, 3*interval)); the static "
+                        "thresholds remain the latest point")
     w.add_argument("--scan", type=int, default=300, help="all-accounts scan seconds (default 300)")
     w.add_argument("--cooldown", type=int, default=0,
                    help="min seconds between swaps (default 0: none needed, a swap "
                         "requires the source to be spent and the target not to be)")
     w.add_argument("--no-rotate", action="store_true", help="dashboard only, never swap")
+    w.add_argument("--no-preempt", action="store_true",
+                   help="only rotate when the active account is spent; never move early "
+                        "to the account whose weekly window resets next")
+    w.add_argument("--preempt-runway", type=float, default=3.0, metavar="HOURS",
+                   help="move early only while the active account's estimated time to any "
+                        "limit exceeds this (default 3; keeps pre-emption off when sessions bind)")
+    w.add_argument("--touch", action="store_true",
+                   help="also open freshly reset weekly windows at once (one request there, "
+                        "then move on); worth it only when a swap costs little quota")
 
     sub.add_parser("status", help="one-shot usage table for all accounts")
     sub.add_parser("add", help="log account(s) in interactively; each is named by its own email",
