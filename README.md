@@ -8,7 +8,7 @@ take 25% of your session token quota. And switching by hand — `/login`, browse
 ccroll removes the chore. It runs in its own terminal as a live dashboard over all of your accounts, estimates when the active one will hit its limits, and **hot-swaps the live credentials to the account whose unused quota would otherwise expire first** — while your session keeps running, untouched.
 
 ```
-ccroll 0.1.0  ·  auto-rotate at session≥95% / fable≥97% or ≤180s from a limit · early to next reset when runway>3h  ·  22:04:31
+ccroll 0.1.0  ·  auto-rotate at session≥95% / fable≥97% or ≤60s from a limit · early to next reset when runway>3h  ·  22:04:31
 
    Account            Session (5h)      Weekly · all      Weekly · Fable    Status
 ─  ─────────────────  ────────────────  ────────────────  ────────────────  ──────
@@ -91,7 +91,7 @@ ccroll rotates away from the active account when any of these hold:
 
 - session (5-hour) usage ≥ `--threshold` (default **95%**) — proactive, so you never see the "limit reached" banner;
 - the governing weekly limit is (nearly) spent;
-- **the burn says a limit is closer than `--lead` seconds** (default 180, or three poll intervals if that is longer) — on any window: session, the governing weekly limit, or weekly-all;
+- **the burn says a limit is closer than `--lead` seconds** (default 60, or one poll interval if that is longer) — on any window: session, the governing weekly limit, or weekly-all;
 - the API reports the account as blocked.
 
 **Static thresholds are the latest point, not the trigger.** With a fan-out of subagents an account can burn 150%/h of its session window: 95% → 100% takes two minutes, which is about one poll plus one swap — too late, and every request in flight dies with a 429. So ccroll predicts the time to each limit from the burn estimate and rotates once that prediction drops under the lead time, however far from the static threshold the account still is. The estimate is deliberately pessimistic: the larger of the 45-minute least-squares slope and the recent step slope, so a burst that started two minutes ago is caught before the fit catches up. It restarts at every swap (samples taken while the account sat idle in the fleet scan say nothing about how it burns once live), a spike must persist across two consecutive polls before it counts (the first poll after a swap shows every running agent re-priming its context at once — a one-time jump, not a rate), and early rotation only applies from 50% of a window upward; below that the static thresholds alone decide. Once a limit is under ten minutes away the active account is polled every 15 s instead of every `--interval`. No burn estimate (first two minutes after a swap) means the static thresholds alone apply; ccroll never rotates on missing data.
@@ -110,7 +110,7 @@ In simulation against a fleet of 4–11 accounts under steady, back-loaded and b
 
 **When every account is spent**, ccroll doesn't give up: it shows which account recovers first and waits for exactly that moment (the latest reset among that account's binding limits), then rescans and rotates as soon as headroom exists.
 
-Tuning: `--threshold`, `--scoped-threshold`, `--lead` (seconds of burn-predicted headroom at which to rotate early, default 180), `--interval` (active-account poll, default 60 s), `--scan` (full-fleet scan, default 300 s), `--preempt-runway` (hours, default 3), `--no-preempt`, `--touch`, `--cooldown`, `--no-rotate` (observe only).
+Tuning: `--threshold`, `--scoped-threshold`, `--lead` (seconds of burn-predicted headroom at which to rotate early, default 60), `--interval` (active-account poll, default 60 s), `--scan` (full-fleet scan, default 300 s), `--preempt-runway` (hours, default 3), `--no-preempt`, `--touch`, `--cooldown`, `--no-rotate` (observe only).
 
 ## Burn estimates
 

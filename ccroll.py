@@ -263,7 +263,7 @@ class Cfg:
         # stay as the latest point).  Covers the poll interval, usage-endpoint
         # lag, the swap itself and requests already in flight.
         lead = getattr(args, "lead", None)
-        self.lead = float(lead) if lead is not None else float(max(180, 3 * self.interval))
+        self.lead = float(lead) if lead is not None else float(max(60, self.interval))
         # pre-emptive rotation: while the active account still has headroom,
         # move to the account whose governing weekly window resets soonest
         # (and, with --touch, open freshly reset windows at once).  Gated on
@@ -1486,7 +1486,7 @@ def main(argv: list[str] | None = None) -> int:
     w.add_argument("--interval", type=int, default=60, help="active-account poll seconds (default 60)")
     w.add_argument("--lead", type=float, default=None, metavar="SECONDS",
                    help="rotate early once the active account's predicted time to any limit at its "
-                        "current burn drops under this (default max(180, 3*interval)); the static "
+                        "current burn drops under this (default 60, or one poll interval if longer); the static "
                         "thresholds remain the latest point")
     w.add_argument("--scan", type=int, default=300, help="all-accounts scan seconds (default 300)")
     w.add_argument("--cooldown", type=int, default=0,
