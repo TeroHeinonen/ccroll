@@ -23,6 +23,11 @@ burn · tero@example.com
   weekly·fable   45.0%  ·  burn    1.9%/h  ·  limit in ≈1d 04h 56m  ·  resets in 5d 01h 12m  ⚠ limit first
   swap cost ≈ session 24% · fable 10% (n=2)
 
+fleet · 4 accounts · if this burn ran around the clock
+  weekly·fable  load  169%  ·  work   319%/wk + handover   336%/wk  ·  capacity   388%/wk  ·  sustainable ≈14.2h/day
+  weekly·all    load   89%  ·  work   185%/wk + handover   168%/wk  ·  capacity   398%/wk  ·  slack  11%
+  handover 51% of demand  ·  cycle ≈ 0d 05h 00m session-limited  ·  4.8 swaps/day
+
 next in line: qa@example.com  (91% fable headroom expires in 6d 01h 33m · 12% session)
 
 events
@@ -132,6 +137,14 @@ Every duration — resets, limit ETAs, token expiries — is shown in a fixed `0
 Two reset cells read as words rather than a duration, and they mean different things. `↺—` is a window that was never opened: it sits at 0% and nothing is expiring. `↺rolled` is a window whose reset has already passed while the usage endpoint is still serving the old figure — the row shows the 0% ccroll is acting on rather than that stale reading, dimmed, because it is a deduction awaiting the next read rather than a measurement. It is never an unchecked one: whichever account gets picked is re-read in full before a swap commits. In the sample above the rolled account is ranked as a fresh window and loses to `qa@example.com`, whose 91% of headroom over six days perishes slightly faster than a stopped clock — the ordering the **Rotation policy** section explains.
 
 The dashboard samples the active account's three windows (session / weekly-all / weekly-scoped) every `--interval` — every 15 s once a limit is within ten minutes — and fits a least-squares slope over the last 45 minutes. The burn rate shown (%/h) and the time-to-limit derived from it are the same pessimistic estimate the rotation rules act on (the larger of that fit and the sustained recent slope; when the two differ by more than a fifth the plain fit is shown alongside in dim text), so the dashboard never says 20 minutes while ccroll acts on 7. It also shows the time until each window resets — and which comes first (`✓ reset first` / `⚠ limit first`). A window reset clears its series automatically, and so does a swap: the series starts again at the new account, skipping the grace period, because samples from before either say nothing about how this account burns now. A first estimate therefore appears about two minutes after the grace ends (three samples) and is shown dimmed until the fit covers 8 minutes; a session can burn out in 10 minutes, so an early rough number beats none.
+
+### Fleet forecast
+
+Below the burn block, the `fleet` block turns the same burn into a question about the whole fleet: **if this rate carried on around the clock, what share of all your accounts' weekly capacity would it consume?** It is there to choose the level of parallelism. More lanes burn faster and, because every swap makes every lane re-send its context, also swap more often and pay more preload per week; the block shows both terms so you can see which one is eating your quota.
+
+Per weekly window it reports the work the burn would demand over 168 hours, the handover cost (swaps per week times the measured preload on that window), the fleet's capacity (readable accounts times that window's rotation threshold), and their ratio as `load`. Over 100% means the fleet cannot sustain this rate: it prints the hours per day it could, which is 24 divided by the load. Under 100% it prints the slack. The dim line beneath gives the handover share of demand, the cycle between swaps and the swaps per day — when the handover share is a large fraction, fewer lanes will deliver more useful work from the same accounts, not less.
+
+The cycle comes from the session window unless the session would reset before its threshold, in which case the governing weekly window sets it. It is a constant-load projection, so it deliberately uses the smoothed fit rather than the spike-inclusive rate rotation acts on, and it shares the burn block's provisional (dimmed) state while the fit is short. With no fit it shows an explanation instead of numbers; before the first swap cost has been measured it shows work only and says so, since the handover term cannot be known yet.
 
 ## Account-switch signals
 

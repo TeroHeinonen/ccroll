@@ -98,6 +98,8 @@ BURN_MIN_SAMPLES = 3
 BURN_MIN_SPAN_S = 90            # 3 polls at the 60s default: a figure after ~2 min
 BURN_SETTLED_SPAN_S = 8 * 60    # shorter fits are shown dimmed as provisional
 BURN_MIN_RATE = 0.05            # %/h below this shows as idle
+SESSION_WINDOW_H = 5.0          # the 5-hour session window, for the fleet forecast
+WEEK_H = 168.0
 PRELOAD_KEEP = 5                # preload measurements kept for the median
 PRELOAD_MEASURE_MAX_S = 300     # after the grace: measure raw if no fit appears within this
 EARLY_MIN_PCT = 50              # burn-based early rotation only from here up: below it an
@@ -843,6 +845,77 @@ def preload_cost(preload: dict | None, cfg: Cfg) -> float | None:
     if not preload:
         return None
     return preload.get("weekly" if cfg.mode == "weekly" else "scoped")
+
+
+# --- fleet forecast -------------------------------------------------------------
+def fleet_forecast(state: dict, name: str, u: Usage, cfg: Cfg, n_accounts: int) -> dict | None:
+    """Constant-load projection for the whole fleet: if the active account's
+    current burn carried on around the clock, what share of the fleet's
+    weekly capacity would it consume, handover overhead included.  This is
+    the number that says whether the level of parallelism fits the number
+    of accounts.  None when there is no burn fit at all.
+
+    Deliberately uses the plain least-squares fit, not the spike-inclusive
+    rate the rotation rules act on: this is a steady-state projection, and
+    a rate that includes the last burst would overstate it.
+
+    Per weekly window:  work = burn × 168 h;  handover = swaps/week × the
+    measured preload on that window;  capacity = accounts × the window's
+    rotation threshold;  load = (work + handover) / capacity.  Swaps/week
+    follow from the cycle between swaps: (session threshold − session
+    preload) / session burn, unless that outlasts the 5-hour window — then
+    the session resets first and the cycle is set by the governing weekly
+    window instead."""
+    fits = {}
+    for key in ("session", "weekly", "scoped"):
+        f = burn_fit(burn_series(state, name, key))
+        if f is not None:
+            fits[key] = f
+    if not fits:
+        return None
+    provisional = any(span < BURN_SETTLED_SPAN_S for _, span in fits.values())
+    est = preload_estimate(state) or {}
+    measured = bool(est) and est.get("session") is not None
+    pre = {k: (est.get(k) or 0.0) for k in ("session", "weekly", "scoped")}
+
+    def rate(key):
+        r = fits.get(key)
+        return None if r is None or r[0] < BURN_MIN_RATE else r[0]
+
+    govern = "weekly" if cfg.mode == "weekly" else "scoped"
+    govern_thr = 99.5 if cfg.mode == "weekly" else cfg.scoped_threshold
+    cycle_h, kind = None, "idle"
+    sr = rate("session")
+    if sr is not None:
+        cycle_h, kind = max(cfg.threshold - pre["session"], 0.0) / sr, "session"
+    if cycle_h is None or cycle_h > SESSION_WINDOW_H:
+        gr = rate(govern)
+        if gr is not None:
+            cycle_h, kind = max(govern_thr - pre[govern], 0.0) / gr, govern
+        else:
+            cycle_h, kind = None, "idle"
+    swaps_wk = (WEEK_H / cycle_h) if cycle_h else 0.0
+
+    windows = []
+    for key, thr in ((govern, govern_thr),) + ((("weekly", 99.5),) if govern != "weekly" else ()):
+        r = rate(key)
+        cap = n_accounts * thr
+        if r is None:
+            windows.append({"key": key, "rate": None, "capacity": cap})
+            continue
+        work = r * WEEK_H
+        hand = swaps_wk * pre[key] if measured else 0.0
+        load = (work + hand) / cap if cap else float("inf")
+        windows.append({"key": key, "rate": r, "work": work, "handover": hand, "capacity": cap,
+                        "load": load, "sustainable_h": 24.0 / load if load > 1 else 24.0,
+                        "blocked": 1 - 1 / load if load > 1 else 0.0})
+    g = windows[0]
+    share = None
+    if g.get("rate") is not None and measured and (g["work"] + g["handover"]) > 0:
+        share = g["handover"] / (g["work"] + g["handover"])
+    return {"windows": windows, "cycle_h": cycle_h, "cycle_kind": kind,
+            "swaps_per_day": swaps_wk / 7, "handover_share": share,
+            "preload_measured": measured, "provisional": provisional, "accounts": n_accounts}
 
 
 # --- account-switch signals -----------------------------------------------------
@@ -1651,6 +1724,44 @@ def render_burn(a: Ansi, state: dict, name: str, u: Usage | None, scoped_label: 
     return lines
 
 
+def render_fleet(a: Ansi, state: dict, name: str, u: Usage | None, cfg: Cfg,
+                 n_accounts: int, scoped_label: str) -> list[str]:
+    """The fleet forecast block: per weekly window, the load the current burn
+    would put on the whole fleet around the clock, and the handover share
+    of that demand — the figure that says whether there are too many lanes
+    for the accounts."""
+    if not u or u.error:
+        return []
+    head = a.bold(f"fleet · {n_accounts} accounts · if this burn ran around the clock")
+    fc = fleet_forecast(state, name, u, cfg, n_accounts)
+    if fc is None:
+        return [head, a.dim("  — no burn estimate yet (a fit needs ~2 min of samples after the grace)")]
+    dim = a.dim if fc["provisional"] else (lambda s: s)
+    lines = [head]
+    for w in fc["windows"]:
+        label = f"weekly·{scoped_label.lower()}" if w["key"] == "scoped" else "weekly·all"
+        if w.get("rate") is None:
+            lines.append(dim(f"  {label:<14}load     —  ·  no burn on this window  ·  capacity {w['capacity']:5.0f}%/wk"))
+            continue
+        hand = (f"{w['handover']:5.0f}%/wk" if fc["preload_measured"] else "    —/wk")
+        if w["load"] > 1:
+            verdict = a.red(f"sustainable ≈{w['sustainable_h']:4.1f}h/day")
+        else:
+            verdict = a.green(f"slack {100 * (1 - w['load']):3.0f}%")
+        lines.append(dim(f"  {label:<14}load {100 * w['load']:4.0f}%  ·  work {w['work']:5.0f}%/wk"
+                         f" + handover {hand}  ·  capacity {w['capacity']:5.0f}%/wk  ·  ") + verdict)
+    if fc["cycle_h"]:
+        kind = {"session": "session-limited", "scoped": f"{scoped_label.lower()}-limited",
+                "weekly": "weekly-limited"}[fc["cycle_kind"]]
+        share = (f"handover {100 * fc['handover_share']:.0f}% of demand" if fc["handover_share"] is not None
+                 else "handover share unknown — swap cost not measured yet")
+        lines.append(a.dim(f"  {share}  ·  cycle ≈ {fmt_dur(fc['cycle_h'] * 3600)} {kind}"
+                           f"  ·  {fc['swaps_per_day']:.1f} swaps/day"))
+    else:
+        lines.append(a.dim("  burn is idle on every window — no swaps at this rate"))
+    return lines
+
+
 # --- scanning -------------------------------------------------------------------
 def scan_accounts(cfg: Cfg, accounts: list[Account], active: str | None) -> dict:
     """Fetch usage for every account in parallel.  The active account is read
@@ -1769,6 +1880,13 @@ class Keyboard:
 
 
 # --- commands -------------------------------------------------------------------
+def readable_accounts(accounts: list, usages: dict) -> int:
+    """How many accounts the fleet forecast may count on: those whose usage
+    could be read (falling back to all of them before the first scan)."""
+    n = sum(1 for acc in accounts if usages.get(acc.name) and not usages[acc.name].error)
+    return n or len(accounts)
+
+
 def build_rows(cfg: Cfg, state: dict, accounts: list[Account], usages: dict):
     """Rows for the table; when the live login matches no store, show it as a
     pseudo-account so the current session is always visible."""
@@ -1796,6 +1914,10 @@ def cmd_status(cfg: Cfg, a: Ansi) -> int:
     if active and usages.get(active):
         print()
         for line in render_burn(a, state, active, usages[active], label):
+            print(line)
+        print()
+        for line in render_fleet(a, state, active, usages[active], cfg,
+                                 readable_accounts(accounts, usages), label):
             print(line)
     target = pick_target(usages, cfg, exclude=active, preload=preload_estimate(state))
     if target:
@@ -1986,6 +2108,8 @@ def cmd_watch(cfg: Cfg, a: Ansi) -> int:
                 what = (f"{near[0]} limit in ≈{fmt_dur(near[3])} at {near[2]:.0f}%/h"
                         if near else f"limit under {FAST_POLL_BELOW_S // 60} min away")
                 lines.append(a.yellow(f"  ⚠ {what} — polling every {FAST_POLL_S} s"))
+            lines += [""] + render_fleet(a, state, active, usages[active], cfg,
+                                         readable_accounts(accounts, usages), label)
         target = pick_target(usages, cfg, exclude=active, preload=preload_estimate(state))
         if target:
             lines += ["", a.dim("next in line: ") + a.green(target)
