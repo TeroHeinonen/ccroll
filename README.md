@@ -114,13 +114,36 @@ In simulation against a fleet of 4–11 accounts under steady, back-loaded and b
 
 **Stale readings don't strand an account, and a failed read doesn't freeze rotation.** A percentage whose reset time has already passed is the endpoint lagging behind a window that has rolled over — an account reported at 100% with an expired reset reads 0% a minute later — so ccroll ignores that window rather than counting the account as spent, and the fresh read before every swap keeps the choice honest. Missing data still never rotates, with one exception: when the *active* account's own usage read fails, which is exactly what an account being throttled does, ccroll falls back to its last error-free snapshot if that is under 15 minutes old and its window has not since reset. A window's percentage only rises until it resets, so a recent "this account is spent" reading is still sound, and the alternative is a live session pinned to an account nobody can see. An account the endpoint throttles is left alone for a minute rather than retried on every poll, and keeps showing its last good numbers with the error noted instead of a blank row.
 
-Tuning: `--threshold`, `--scoped-threshold`, `--lead` (seconds of burn-predicted headroom at which to rotate early, default 60), `--interval` (active-account poll, default 60 s), `--scan` (full-fleet scan, default 300 s), `--preempt-runway` (hours, default 3), `--no-preempt`, `--touch`, `--grace` (post-swap seconds without burn-based rotation or pre-emption, default 300), `--preempt-max-cost` (percent of the governing window a swap may cost before pre-emption is skipped, default 5), `--sync-identity` (off by default, see below), `--cooldown`, `--no-rotate` (observe only).
+Tuning: `--threshold`, `--scoped-threshold`, `--lead` (seconds of burn-predicted headroom at which to rotate early, default 60), `--interval` (active-account poll, default 60 s), `--scan` (full-fleet scan, default 300 s), `--preempt-runway` (hours, default 3), `--no-preempt`, `--touch`, `--grace` (post-swap seconds without burn-based rotation or pre-emption, default 300), `--preempt-max-cost` (percent of the governing window a swap may cost before pre-emption is skipped, default 5), `--sync-identity` (off by default, see below), `--cooldown`, `--no-rotate` (observe only), `--signal-dir`, `--no-signal` (see **Account-switch signals**).
 
 ## Burn estimates
 
 Every duration — resets, limit ETAs, token expiries — is shown in a fixed `0d 00h 00m` format with days, hours and minutes each in their own color (zero-value leading units dimmed), so remaining time reads in a single glance.
 
 The dashboard samples the active account's three windows (session / weekly-all / weekly-scoped) once per minute and fits a least-squares slope over the last 45 minutes. The burn rate shown (%/h) and the time-to-limit derived from it are the same pessimistic estimate the rotation rules act on (the larger of that fit and the sustained recent slope; when the two differ by more than a fifth the plain fit is shown alongside in dim text), so the dashboard never says 20 minutes while ccroll acts on 7. It also shows the time until each window resets — and which comes first (`✓ reset first` / `⚠ limit first`). A window reset clears its series automatically. A first estimate appears after ~2 minutes (three samples) and is shown dimmed until the fit covers 8 minutes; a session can burn out in 10 minutes, so an early rough number beats none.
+
+## Account-switch signals
+
+Other Claude Code sessions on the machine can be told when a rotation is coming and when it has happened, so a session can hold off spawning an expensive fan-out moments before a swap and relaunch cheaply after one. ccroll writes two files under the live config dir; sessions only read them, and if the files are absent sessions behave exactly as before.
+
+- `~/.claude/account-switch/events.jsonl` — append-only, one JSON object per line, flushed and `fsync`ed per line so a `tail -F` never misses one. Never rewritten or truncated. Rotate it by renaming, at a moment with no live sessions.
+- `~/.claude/account-switch/state.json` — the latest snapshot (`seq`, `account`, `next_switch_eta_utc`, `window_resets_utc`), replaced atomically.
+
+Three events, and nothing else — no heartbeats and no countdowns, because every line costs each reading session a turn:
+
+| Event | When | Fields |
+|---|---|---|
+| `switch_expected` | once, about 3 minutes ahead; again only if the ETA moves by more than 3 minutes | `eta_utc`, `usage_pct` |
+| `switch_done` | once, immediately after the new account is live | `account`, `window_resets_utc` |
+| `usage_threshold` | crossing 75% and 90%, once each per account | `usage_pct` |
+
+`seq` is strictly increasing and never rewinds: on startup ccroll takes the highest value already in either file, so losing its own state cannot confuse a session still tailing the log. `ts` and every time field are ISO-8601 UTC with a literal `Z`. The `account` field is an **opaque label** (`acct-07`), stable per account and persisted, so the feed never carries an email — a guard refuses to write any value containing `@`.
+
+The ETA in `switch_expected` is the time until ccroll would *actually rotate*, which means the earlier of reaching the static threshold and coming within `--lead` of 100%, computed from the same pessimistic burn the rotation rules use. It stays silent while there is no burn estimate, which includes the post-swap grace period, and while rotation is paused. `window_resets_utc` is the new account's 5-hour session window; it is `null` when that window has not opened yet, and the snapshot is filled in once a later poll learns it.
+
+Writing a signal can never break or delay a swap: every write is wrapped, and a full disk or a read-only home is logged to the event list and swallowed. `--signal-dir` moves the feed, `--no-signal` turns it off.
+
+**Two things ccroll deliberately does not do.** It does not edit `~/.claude/settings.json`; it only checks at startup that `"autoContinueAtUsageLimit": true` is set (so the CLI waits out a usage limit instead of prompting) and warns if it is not, because that file is yours. And it does not send keystrokes to other terminals to dismiss a usage-limit dialog — ccroll has no handle on those sessions, so that fallback has to stay manual.
 
 ## What ccroll writes, and where
 
@@ -131,6 +154,7 @@ The OAuth token endpoint only serves requests carrying the official client signa
 
 - `~/.claude-accounts/.ccroll/state.json` — active-account marker, per-account emails, burn-rate samples, event log. No secrets.
 - `~/.claude/.credentials.json` (or `$CLAUDE_CONFIG_DIR`) — replaced atomically on each swap; harvested back into the store first so rotated refresh tokens survive.
+- `~/.claude/account-switch/{events.jsonl,state.json}` — the account-switch feed for other sessions (0700 dir): opaque account labels, timestamps and percentages, no emails and no secrets. `--no-signal` turns it off.
 - `~/.claude.json` — **only with `--sync-identity`, and only its `oauthAccount` key** (see below). Never otherwise, and never replaced wholesale: that file also holds every project's session history.
 
 Nothing is ever sent anywhere except Anthropic's own OAuth/usage endpoints.

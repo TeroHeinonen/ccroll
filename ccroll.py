@@ -51,7 +51,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timezone
 
 CCROLL_VERSION = "0.1.0"
 
@@ -100,6 +100,15 @@ PRELOAD_MEASURE_MAX_S = 300     # after the grace: measure raw if no fit appears
 EARLY_MIN_PCT = 50              # burn-based early rotation only from here up: below it an
                                 # ETA under the lead would need >1000%/h, which is noise
                                 # (the post-swap re-prime spike), not a sustained rate
+SIGNAL_DIRNAME = "account-switch"   # under the live Claude config dir
+SIGNAL_EVENTS_FILE = "events.jsonl"
+SIGNAL_STATE_FILE = "state.json"
+SIGNAL_EXPECT_LEAD_S = 180      # announce a switch about this long before it
+SIGNAL_ETA_DRIFT_S = 180        # re-announce only when the ETA moves this much
+SIGNAL_MARKS = (75, 90)         # the only utilisation crossings that are announced
+SIGNAL_TAIL_BYTES = 65536       # how much of events.jsonl to scan for the highest seq
+SETTINGS_FILE = "settings.json"
+
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@+-]{0,127}$")  # account emails
 LIVE_PSEUDO = "(live login)"  # display row for a live login not in the store
 
@@ -297,6 +306,14 @@ class Cfg:
         # more than --preempt-max-cost percent of the governing window.
         self.grace = float(getattr(args, "grace", 300))
         self.preempt_max_cost = float(getattr(args, "preempt_max_cost", 5.0))
+        # account-switch signals: a small append-only feed that every other
+        # Claude Code session on this machine can tail, so a session can avoid
+        # spawning expensive work moments before a swap and relaunch cheaply
+        # after one.  ccroll is the only writer; sessions only read.
+        self.signal = not getattr(args, "no_signal", False)
+        self.signal_dir = os.path.expanduser(
+            getattr(args, "signal_dir", None) or os.path.join(self.live_dir, SIGNAL_DIRNAME))
+        self.settings_path = os.path.join(self.live_dir, SETTINGS_FILE)
         # which weekly limit governs exhaustion + next-account choice:
         # "scoped" = the per-model weekly limit (Fable on current Max plans),
         # "weekly" = the all-models weekly limit.
@@ -543,6 +560,8 @@ def load_state(cfg: Cfg) -> dict:
     state.setdefault("last_swap", 0)
     state.setdefault("grace_until", 0)
     state.setdefault("preload", [])
+    state.setdefault("signal_labels", {})
+    state.setdefault("signal_crossed", [])
     return state
 
 
@@ -728,8 +747,12 @@ def do_swap(cfg: Cfg, state: dict, target: Account, reason: str,
                                "session": snapshot.session_pct, "weekly": snapshot.weekly_pct,
                                "scoped": snapshot.scoped_pct}
                               if snapshot and not snapshot.error else None)
+    signal_after_swap(state)
     detail = f"left {prev}: {reason}" if prev and prev != target.name else reason
     add_event(state, f"→ {target.name} ({detail})")
+    with signal_guard(state, "switch_done"):
+        signal_switch_done(cfg, state, target.name,
+                           snapshot.session_reset if snapshot and not snapshot.error else None)
     if cfg.sync_identity:
         note = swap_identity(cfg, target)
         if note:
@@ -810,6 +833,229 @@ def preload_cost(preload: dict | None, cfg: Cfg) -> float | None:
     if not preload:
         return None
     return preload.get("weekly" if cfg.mode == "weekly" else "scoped")
+
+
+# --- account-switch signals -----------------------------------------------------
+# A tiny protocol other Claude Code sessions on this machine tail so they can
+# hold off spawning expensive work moments before a swap, and relaunch cheaply
+# after one.  ccroll is the only writer; sessions only read.  Two files under
+# the live config dir: an append-only `events.jsonl` (never rewritten, never
+# truncated) and a `state.json` snapshot replaced atomically.  Three events
+# only — no heartbeats, no countdowns: every line costs each reader a turn.
+def _utc(t: float | None) -> str | None:
+    """The protocol's time format: ISO-8601 UTC, second resolution, literal Z."""
+    if t is None:
+        return None
+    return datetime.fromtimestamp(t, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def signal_paths(cfg: Cfg) -> tuple[str, str]:
+    return (os.path.join(cfg.signal_dir, SIGNAL_EVENTS_FILE),
+            os.path.join(cfg.signal_dir, SIGNAL_STATE_FILE))
+
+
+def _max_seq_in_events(path: str) -> int:
+    """Highest seq already in the log.  seq only ever increases, so the tail
+    carries the maximum; the partial line the seek lands in is dropped."""
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as fh:
+            if size > SIGNAL_TAIL_BYTES:
+                fh.seek(-SIGNAL_TAIL_BYTES, os.SEEK_END)
+                fh.readline()
+            blob = fh.read()
+    except OSError:
+        return 0
+    best = 0
+    for line in blob.splitlines():
+        try:
+            seq = json.loads(line).get("seq")
+        except (json.JSONDecodeError, UnicodeDecodeError, AttributeError):
+            continue                      # a malformed line must not stop us
+        if isinstance(seq, int) and seq > best:
+            best = seq
+    return best
+
+
+def signal_init(cfg: Cfg, state: dict) -> None:
+    """Fix the counter at or above every seq anyone has already seen, so a lost
+    ccroll state can never rewind the feed for a session that is still tailing."""
+    if not cfg.signal:
+        return
+    events_path, state_path = signal_paths(cfg)
+    seen = [int(state.get("signal_seq") or 0), _max_seq_in_events(events_path)]
+    snap = read_json(state_path) or {}
+    if isinstance(snap.get("seq"), int):
+        seen.append(snap["seq"])
+    state["signal_seq"] = max(seen)
+
+
+def signal_label(state: dict, name: str) -> str:
+    """A stable opaque label per account (`acct-07`).  The feed is readable by
+    every session on the machine, so it never carries an email.  Labels are
+    persisted, so they do not shift when accounts are added or removed."""
+    labels = state.setdefault("signal_labels", {})
+    if name not in labels:
+        used = set(labels.values())
+        n = 1
+        while f"acct-{n:02d}" in used:
+            n += 1
+        labels[name] = f"acct-{n:02d}"
+    return labels[name]
+
+
+def _signal_check_opaque(fields: dict) -> None:
+    """Last line of defence: nothing address-shaped reaches the feed."""
+    for key, value in fields.items():
+        if isinstance(value, str) and "@" in value:
+            raise CcrollError(f"refusing to write {key}={value!r} to the signal feed")
+
+
+def signal_write(cfg: Cfg, state: dict, event: str, fields: dict,
+                 snapshot: dict | None = None) -> None:
+    """Append one protocol event, then replace the snapshot atomically."""
+    if not cfg.signal:
+        return
+    _signal_check_opaque(fields)
+    if "signal_seq" not in state:
+        signal_init(cfg, state)
+    os.makedirs(cfg.signal_dir, mode=0o700, exist_ok=True)
+    seq = int(state.get("signal_seq") or 0) + 1
+    state["signal_seq"] = seq
+    line = {"seq": seq, "ts": _utc(now()), "event": event}
+    line.update(fields)
+    events_path, _ = signal_paths(cfg)
+    with open(events_path, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(line, separators=(",", ":")) + "\n")
+        fh.flush()
+        os.fsync(fh.fileno())            # a reader must never miss a written line
+    _signal_snapshot(cfg, state, snapshot or {}, seq=seq)
+
+
+def _signal_snapshot(cfg: Cfg, state: dict, updates: dict, seq: int | None = None) -> None:
+    """Rewrite `state.json` — the latest view, atomically replaced."""
+    snap = state.setdefault("signal_snapshot",
+                            {"account": None, "next_switch_eta_utc": None,
+                             "window_resets_utc": None})
+    snap.update(updates)
+    _signal_check_opaque(snap)
+    blob = {"seq": seq if seq is not None else int(state.get("signal_seq") or 0),
+            "account": snap.get("account"),
+            "next_switch_eta_utc": snap.get("next_switch_eta_utc"),
+            "window_resets_utc": snap.get("window_resets_utc")}
+    os.makedirs(cfg.signal_dir, mode=0o700, exist_ok=True)
+    _, state_path = signal_paths(cfg)
+    write_json_atomic(state_path, blob)
+
+
+@contextlib.contextmanager
+def signal_guard(state: dict, what: str):
+    """A signal must never break or delay a swap: a full disk or a read-only
+    home is logged and swallowed."""
+    try:
+        yield
+    except Exception as e:                # noqa: BLE001 — deliberately broad
+        with contextlib.suppress(Exception):
+            add_event(state, f"signal {what} failed: {e}")
+
+
+def signal_switch_done(cfg: Cfg, state: dict, name: str, session_reset: float | None) -> None:
+    """Sent once, immediately after the new account is live.  The reset is the
+    new account's 5-hour session window; null when it has not opened yet."""
+    label = signal_label(state, name)
+    resets = _utc(session_reset) if session_reset and session_reset > now() else None
+    signal_write(cfg, state, "switch_done", {"account": label, "window_resets_utc": resets},
+                 snapshot={"account": label, "window_resets_utc": resets,
+                           "next_switch_eta_utc": None})
+
+
+def signal_switch_expected(cfg: Cfg, state: dict, eta_abs: float, usage_pct: int) -> None:
+    """Sent once about three minutes ahead; re-sent only if the ETA moves."""
+    eta = _utc(eta_abs)
+    signal_write(cfg, state, "switch_expected", {"eta_utc": eta, "usage_pct": usage_pct},
+                 snapshot={"next_switch_eta_utc": eta})
+
+
+def signal_usage_threshold(cfg: Cfg, state: dict, usage_pct: int) -> None:
+    signal_write(cfg, state, "usage_threshold", {"usage_pct": usage_pct})
+
+
+def signal_after_swap(state: dict) -> None:
+    """A swap resets what has been announced: the next approach signals afresh."""
+    state["signal_expect_eta"] = None
+    state["signal_crossed"] = []
+
+
+def maybe_signal_expected(cfg: Cfg, state: dict, name: str, u: "Usage | None",
+                          rotating: bool) -> None:
+    """Announce the coming switch once its predicted moment is about three
+    minutes out.  Needs a burn estimate, so it stays quiet through the
+    post-swap grace, and stays quiet while rotation is paused."""
+    if not cfg.signal or not rotating or u is None or u.error:
+        return
+    if not name or name == LIVE_PSEUDO or in_grace(state):
+        return
+    predicted = predicted_switch_eta(state, name, u, cfg)
+    if predicted is None or predicted[0] > SIGNAL_EXPECT_LEAD_S:
+        return
+    eta_abs = now() + predicted[0]
+    last = state.get("signal_expect_eta")
+    if last is not None and abs(eta_abs - last) <= SIGNAL_ETA_DRIFT_S:
+        return                            # same prediction, already announced
+    state["signal_expect_eta"] = eta_abs
+    with signal_guard(state, "switch_expected"):
+        signal_switch_expected(cfg, state, eta_abs, int(round(predicted[1])))
+
+
+def maybe_signal_threshold(cfg: Cfg, state: dict, name: str, u: "Usage | None") -> None:
+    """Announce crossing 75% and 90%, once each per account.  The protocol's
+    event carries only a utilisation, so the figure is the highest across the
+    windows that can trigger rotation; emitting one line per window would be
+    indistinguishable noise."""
+    if not cfg.signal or u is None or u.error or not name or name == LIVE_PSEUDO:
+        return
+    pcts = [u.session_pct, u.weekly_pct]
+    if cfg.mode == "scoped":
+        pcts.append(u.scoped_pct)
+    live = [p for p in pcts if p is not None]
+    if not live:
+        return
+    pct = max(live)
+    # utilisation falling below a mark means a window reset: let it fire again
+    crossed = {m for m in (state.get("signal_crossed") or []) if m <= pct}
+    for mark in SIGNAL_MARKS:
+        if pct >= mark and mark not in crossed:
+            crossed.add(mark)
+            with signal_guard(state, "usage_threshold"):
+                signal_usage_threshold(cfg, state, int(round(pct)))
+    state["signal_crossed"] = sorted(crossed)
+
+
+def maybe_signal_reset(cfg: Cfg, state: dict, name: str, u: "Usage | None") -> None:
+    """A freshly swapped-to account may not have opened its session window
+    yet; fill the reset into the snapshot once a poll learns it."""
+    if not cfg.signal or u is None or u.error or not name or name == LIVE_PSEUDO:
+        return
+    snap = state.get("signal_snapshot") or {}
+    if snap.get("window_resets_utc") is not None or snap.get("account") is None:
+        return
+    if not u.session_reset or u.session_reset <= now():
+        return
+    with signal_guard(state, "snapshot"):
+        _signal_snapshot(cfg, state, {"window_resets_utc": _utc(u.session_reset)})
+
+
+def check_auto_continue(cfg: Cfg) -> str | None:
+    """The protocol leans on the CLI waiting out a usage limit rather than
+    prompting.  Report the setting; never edit it — it is the user's file."""
+    blob = read_json(cfg.settings_path)
+    if blob is None:
+        return (f"{cfg.settings_path} is missing or unreadable — add "
+                '"autoContinueAtUsageLimit": true to it')
+    if blob.get("autoContinueAtUsageLimit") is not True:
+        return (f'"autoContinueAtUsageLimit" is not true in {cfg.settings_path} — '
+                "set it so the CLI waits out a usage limit instead of asking")
+    return None
 
 
 # --- rotation policy ------------------------------------------------------------
@@ -921,6 +1167,52 @@ def limit_etas(state: dict, name: str, u: Usage, cfg: Cfg) -> list:
         rate, _, eta, _ = window_eta(state, name, key, pct)
         out.append((key, label, pct, rate, eta))
     return out
+
+
+def eta_to_threshold(pct: float | None, rate: float | None, threshold: float) -> float | None:
+    """Seconds until a window reaches the value that *triggers rotation*, as
+    opposed to `eta_to_limit`, which counts to 100%."""
+    if pct is None or rate is None or rate < BURN_MIN_RATE:
+        return None
+    return max(0.0, threshold - pct) / rate * 3600
+
+
+def threshold_etas(state: dict, name: str, u: Usage, cfg: Cfg) -> list:
+    """(key, label, pct, rate, eta-to-threshold) per rotating window."""
+    windows = [("session", "session", u.session_pct, cfg.threshold),
+               ("weekly", "weekly", u.weekly_pct, 99.5)]
+    if cfg.mode == "scoped":
+        windows.append(("scoped", (u.scoped_label or "scoped").lower() + " weekly",
+                        u.scoped_pct, cfg.scoped_threshold))
+    out = []
+    for key, label, pct, thr in windows:
+        if pct is None:
+            continue
+        rate = active_burn(state, name, key)
+        out.append((key, label, pct, rate, eta_to_threshold(pct, rate, thr)))
+    return out
+
+
+def predicted_switch_eta(state: dict, name: str, u: Usage, cfg: Cfg):
+    """(seconds until ccroll would actually rotate, utilisation of the window
+    driving it), or None.  Rotation fires at the static threshold *or*
+    `--lead` before 100%, whichever comes first, so the prediction honours
+    both — otherwise the signal would disagree with the swap it announces."""
+    best = None
+    for _, _, pct, rate, eta_thr in threshold_etas(state, name, u, cfg):
+        if rate is None:
+            continue
+        etas = [] if eta_thr is None else [eta_thr]
+        if pct >= EARLY_MIN_PCT:
+            hard = eta_to_limit(pct, rate)
+            if hard is not None:
+                etas.append(max(0.0, hard - cfg.lead))
+        if not etas:
+            continue
+        eta = min(etas)
+        if best is None or eta < best[0]:
+            best = (eta, pct)
+    return best
 
 
 def nearest_limit(state: dict, name: str, u: Usage, cfg: Cfg):
@@ -1452,6 +1744,13 @@ def cmd_watch(cfg: Cfg, a: Ansi) -> int:
         print(a.yellow("No accounts under " + cfg.root))
         print("Add each subscription account with:  ccroll add")
         return 1
+    if cfg.signal:
+        signal_init(cfg, state)
+        warn = check_auto_continue(cfg)
+        if warn:
+            print(a.yellow("⚠ " + warn))
+            print(a.dim("  (it applies after a CLI restart; ccroll never edits your settings)"))
+            time.sleep(2)
     monitor = LiveMonitor(cfg, state)
     usages: dict[str, Usage] = {}
     last_good: dict[str, Usage] = {}   # newest error-free read per account
@@ -1500,6 +1799,9 @@ def cmd_watch(cfg: Cfg, a: Ansi) -> int:
             if name:
                 record_samples(state, {name: usages[key]})
                 measure_preload(state, usages, cfg)
+                maybe_signal_threshold(cfg, state, name, usages[key])
+                maybe_signal_reset(cfg, state, name, usages[key])
+                maybe_signal_expected(cfg, state, name, usages[key], not paused)
                 save_state(cfg, state)
         next_active_poll = now() + poll_interval()
 
@@ -1801,6 +2103,7 @@ def cmd_adopt(cfg: Cfg, a: Ansi) -> int:
 
 def cmd_switch(cfg: Cfg, a: Ansi, name: str) -> int:
     state = load_state(cfg)
+    signal_init(cfg, state)
     target = get_account(cfg, name)
     do_swap(cfg, state, target, "manual")
     print(a.green(f"✓ live credentials now {target.name} — running sessions pick this up automatically"))
@@ -1874,6 +2177,11 @@ def main(argv: list[str] | None = None) -> int:
     w.add_argument("--preempt-max-cost", type=float, default=5.0, metavar="PERCENT",
                    help="skip pre-emption when the measured swap cost (preload) on the governing "
                         "weekly window exceeds this (default 5)")
+    w.add_argument("--signal-dir", metavar="DIR",
+                   help="where to write the account-switch feed other Claude Code sessions "
+                        "tail (default <claude-dir>/account-switch)")
+    w.add_argument("--no-signal", action="store_true",
+                   help="do not write the account-switch feed at all")
     w.add_argument("--sync-identity", action="store_true", help="also point Claude Code's displayed identity (the `oauthAccount` block in its global config) at the account swapped to, so /status stops naming the previous one; auth already follows the swap without this. Off by default: running sessions cache that config in memory, so the correction usually shows up only in newly started sessions, and a session that rewrites the file from memory undoes it")
 
     sub.add_parser("status", help="one-shot usage table for all accounts")
@@ -1882,6 +2190,11 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("adopt", help="save the current live login into the store under its email")
     sp = sub.add_parser("switch", help="hot-swap the live credentials now")
     sp.add_argument("name", help="account email (a unique prefix is enough)")
+    sp.add_argument("--signal-dir", metavar="DIR",
+                   help="where to write the account-switch feed other Claude Code sessions "
+                        "tail (default <claude-dir>/account-switch)")
+    sp.add_argument("--no-signal", action="store_true",
+                   help="do not write the account-switch feed at all")
     sp.add_argument("--sync-identity", action="store_true", help="also point Claude Code's displayed identity (the `oauthAccount` block in its global config) at the account swapped to, so /status stops naming the previous one; auth already follows the swap without this. Off by default: running sessions cache that config in memory, so the correction usually shows up only in newly started sessions, and a session that rewrites the file from memory undoes it")
     sub.add_parser("list", help="accounts and token expiries")
 
