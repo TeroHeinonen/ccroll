@@ -84,7 +84,9 @@ ROLLED_MARK = "rolled"          # reset column for a window whose reset has pass
 RESCAN_MIN_S = 30               # floor on any scheduled rescan, so a stale reset time
                                 # can never turn the watch loop into a scan storm
 LAST_GOOD_MAX_AGE_S = 15 * 60   # how long a cached usage read stands in for a failed one
-USAGE_ERROR_COOLDOWN_S = 60     # back off this long on an account the endpoint throttles
+USAGE_ERROR_COOLDOWN_S = 60     # first back-off on an account the endpoint throttles;
+                                # doubles on every further 429 in a row, resets on a good read
+USAGE_BACKOFF_CAP_S = 300       # the back-off never exceeds a fleet scan interval
 FRESH_PERISH_RATE = 97 / 168    # %/h an unopened weekly window "loses" by not starting
                                 # its 7-day clock: one full window per week
 TOUCH_REASON = "opens a fresh"  # prefix of the reason a --touch move carries
@@ -439,6 +441,10 @@ class Usage:
         self.scoped_label = None
         self.status = None
         self.error = None
+        self.throttled = False      # this read itself got a 429 (not the synthetic cooldown)
+        self.projected_from = None  # {session, weekly, scoped}: the raw reading, when projected
+        self.projected_rate = None  # {key: %/h} the projection advanced each window by
+        self.projected_age = None   # seconds between that reading and the projection
         self.fetched_at = now()
 
     def windows(self):
@@ -488,21 +494,25 @@ def fetch_usage(token: str) -> Usage:
     return u
 
 
-_usage_cooldown: dict[str, float] = {}
+_usage_cooldown: dict[str, tuple[float, float]] = {}   # cred_path -> (until, delay)
 
 
 def _rate_limited(err: str | None) -> bool:
     return bool(err) and ("rate_limit" in err or "429" in err)
 
 
-def usage_for(cred_path: str) -> Usage:
+def usage_for(cred_path: str, backoff_cap: float = USAGE_BACKOFF_CAP_S) -> Usage:
     """Fetch usage for stored credentials, refreshing the token when needed
     (including one retry when a supposedly-valid token turns out revoked).
 
-    An account the endpoint has just throttled is left alone for
-    USAGE_ERROR_COOLDOWN_S: retrying it every poll only deepens the throttle,
-    and the caller keeps showing its last good numbers meanwhile."""
-    until = _usage_cooldown.get(cred_path)
+    An account the endpoint has just throttled is left alone for a while:
+    retrying it every poll only deepens the throttle, and the caller keeps
+    showing its last good numbers meanwhile.  The back-off starts at
+    USAGE_ERROR_COOLDOWN_S and doubles on every consecutive 429 up to
+    `backoff_cap`, so a throttle that is still in force gets fewer and fewer
+    retries to feed on, and resets on the first clean read.  A fixed 60 s
+    retry kept one throttle alive for eleven minutes."""
+    until, delay = _usage_cooldown.get(cred_path, (0.0, 0.0))
     if until and now() < until:
         u = Usage()
         u.error = f"rate_limit_error (retrying in {until - now():.0f}s)"
@@ -522,7 +532,9 @@ def usage_for(cred_path: str) -> Usage:
         except CcrollError as e:
             u = Usage(); u.error = str(e)
     if _rate_limited(u.error):
-        _usage_cooldown[cred_path] = now() + USAGE_ERROR_COOLDOWN_S
+        u.throttled = True
+        delay = min(backoff_cap, delay * 2) if delay else USAGE_ERROR_COOLDOWN_S
+        _usage_cooldown[cred_path] = (now() + delay, delay)
     else:
         _usage_cooldown.pop(cred_path, None)
     return u
@@ -1249,22 +1261,38 @@ def window_spent(pct: float | None, reset: float | None, threshold: float,
     return effective_pct(pct, reset, t) >= threshold
 
 
+def pct_text(u: Usage, key: str, pct: float | None) -> str:
+    """A window's utilisation as the rotation reason states it.  When the
+    figure is a projection, say so and show what it was projected from:
+    `≈96% (91% read 6m ago + 80%/h)`."""
+    if pct is None:
+        return "—"
+    raw = (u.projected_from or {}).get(key)
+    rate = (u.projected_rate or {}).get(key)
+    if raw is None or rate is None or round(pct) == round(raw):
+        return f"{pct:.0f}%"
+    return (f"≈{pct:.0f}% ({raw:.0f}% read {_fmt_eta_short(u.projected_age or 0)} ago"
+            f" + {rate:.0f}%/h)")
+
+
 def is_exhausted(u: Usage | None, cfg: Cfg) -> str | None:
     """Return the reason the account counts as spent, or None.
 
     A failed read yields None — missing data never rotates.  The watch loop
     handles the one case where that is not enough (the *active* account
-    going unreadable) by falling back to its last good snapshot."""
+    going unreadable) by falling back to its last good snapshot, projected
+    forward by its age (`projected_usage`)."""
     if u is None or u.error:
         return None  # never rotate on missing data
     if (u.status or "").lower() in ("rejected", "exceeded", "blocked"):
         return f"status {u.status}"
     if window_spent(u.session_pct, u.session_reset, cfg.threshold):
-        return f"session {u.session_pct:.0f}%"
+        return "session " + pct_text(u, "session", u.session_pct)
     if cfg.mode == "scoped" and window_spent(u.scoped_pct, u.scoped_reset, cfg.scoped_threshold):
-        return f"{(u.scoped_label or 'scoped').lower()} weekly {u.scoped_pct:.0f}%"
+        return (f"{(u.scoped_label or 'scoped').lower()} weekly "
+                + pct_text(u, "scoped", u.scoped_pct))
     if window_spent(u.weekly_pct, u.weekly_reset, 99.5):
-        return f"weekly {u.weekly_pct:.0f}%"
+        return "weekly " + pct_text(u, "weekly", u.weekly_pct)
     return None
 
 
@@ -1274,8 +1302,10 @@ def rotation_usage(last_good: dict, name: str, u: Usage | None) -> tuple[Usage |
     A usage read that fails is exactly what a throttled or rate-limited
     account does, and refusing to act on it strands the live session on a
     dead account.  A window's percentage only ever rises until it resets, so
-    a recent error-free snapshot is still a sound basis for "this account is
-    spent" — and `is_exhausted` ignores any window whose reset has since
+    a recent error-free snapshot is a *lower bound* on where the account is
+    now — sound for "this account is spent", never for "it still has room".
+    The caller projects it forward by its age (`projected_usage`) before
+    judging it; `is_exhausted` ignores any window whose reset has since
     passed.  Returns (usage, age of the snapshot in seconds), age None when
     the current read is good."""
     if u is not None and not u.error:
@@ -1287,6 +1317,45 @@ def rotation_usage(last_good: dict, name: str, u: Usage | None) -> tuple[Usage |
     if age > LAST_GOOD_MAX_AGE_S:
         return None, None
     return snap, age
+
+
+def projected_usage(state: dict, name: str, u: Usage, t: float | None = None) -> Usage:
+    """The active account's reading advanced to `t` at its measured burn.
+
+    Every reading is a lower bound the moment it is taken: the agents keep
+    consuming while ccroll waits for the next poll, and for as long as the
+    endpoint refuses to answer.  A frozen 91% can never cross a 95%
+    threshold, however long the blackout — which is how privacy@ was held at
+    "91%" for eleven minutes while it burned through to 100%.  So each window
+    is advanced by rate × age, using the same conservative rate the burn
+    rules act on, and capped at 100.  Windows without a burn estimate, or
+    whose reset has passed, are left as read; nothing is projected during
+    the post-swap grace, when no rate exists.  The copy records the raw
+    reading, the rate and the age so a reason or a dashboard line can show
+    its working."""
+    t = now() if t is None else t
+    age = max(0.0, t - u.fetched_at)
+    out = copy.copy(u)
+    if u.error or not name or name == LIVE_PSEUDO or in_grace(state, t):
+        return out
+    raw, rates, moved = {}, {}, False
+    for key, pct, reset in (("session", u.session_pct, u.session_reset),
+                            ("weekly", u.weekly_pct, u.weekly_reset),
+                            ("scoped", u.scoped_pct, u.scoped_reset)):
+        raw[key] = pct
+        if pct is None or window_rolled(reset, t):
+            continue
+        rate = active_burn(state, name, key)
+        if rate is None or rate < BURN_MIN_RATE:
+            continue
+        rates[key] = rate
+        setattr(out, f"{key}_pct", min(100.0, pct + rate * age / 3600.0))
+        moved = True
+    if moved:
+        out.projected_from = raw
+        out.projected_rate = rates
+        out.projected_age = age
+    return out
 
 
 def active_burn(state: dict, name: str, key: str) -> float | None:
@@ -1415,11 +1484,12 @@ def about_to_exhaust(state: dict, name: str, u: Usage | None, cfg: Cfg) -> str |
     Only the active account has a burn series; missing data never rotates."""
     if u is None or u.error or not name or name == LIVE_PSEUDO or in_grace(state):
         return None
-    for _, label, pct, rate, eta in limit_etas(state, name, u, cfg):
+    for key, label, pct, rate, eta in limit_etas(state, name, u, cfg):
         if pct < EARLY_MIN_PCT:
             continue
         if eta is not None and eta <= cfg.lead:
-            return f"{label} {pct:.0f}% · ≈{_fmt_eta_short(eta)} to limit at {rate:.0f}%/h"
+            return (f"{label} {pct_text(u, key, pct)} · ≈{_fmt_eta_short(eta)} "
+                    f"to limit at {rate:.0f}%/h")
     return None
 
 
@@ -1654,19 +1724,26 @@ def earliest_recovery(usages: dict, cfg: Cfg) -> tuple[float, str] | None:
     return best
 
 
-def merged_view(usages: dict, last_good: dict) -> dict:
+def merged_view(usages: dict, last_good: dict, state: dict | None = None) -> dict:
     """Usages for display: an account whose read just failed keeps showing its
-    last good numbers, with the error noted, rather than blanking its row."""
+    last good numbers, with the error noted, rather than blanking its row.
+    The active account is shown as rotation judges it — its last reading
+    projected forward by its age — so a blackout shows the figure ccroll is
+    acting on, not the one the endpoint last managed to serve."""
     view = {}
+    active = (state or {}).get("active")
     for name, u in usages.items():
         snap = last_good.get(name)
+        shown = u
         if u is not None and u.error and snap is not None \
                 and now() - snap.fetched_at <= LAST_GOOD_MAX_AGE_S:
             shown = copy.copy(snap)
             shown.stale_note = u.error
-            view[name] = shown
-        else:
-            view[name] = u
+        if state is not None and name == active and shown is not None and not shown.error:
+            note = shown.stale_note
+            shown = projected_usage(state, name, shown)
+            shown.stale_note = note
+        view[name] = shown
     return view
 
 
@@ -1778,6 +1855,19 @@ def render_burn(a: Ansi, state: dict, name: str, u: Usage | None, scoped_label: 
             note = a.dim(f"(fit {fit_rate:.1f}%/h)")
         tail = "  ".join(x for x in (verdict, note) if x)
         lines.append(f"  {label:<14}" + "  ·  ".join(parts) + ("  " + tail if tail else ""))
+    if u.projected_from and u.stale_note:
+        bits = []
+        for key, label in (("session", "session"), ("weekly", "weekly·all"),
+                           ("scoped", f"weekly·{scoped_label.lower()}")):
+            raw = u.projected_from.get(key)
+            rate = (u.projected_rate or {}).get(key)
+            cur = getattr(u, f"{key}_pct")
+            if raw is None or rate is None or cur is None or round(cur) == round(raw):
+                continue
+            bits.append(f"{label} {raw:.0f}% read, ≈{cur:.0f}% projected at {rate:.0f}%/h")
+        if bits:
+            lines.append(a.yellow(f"  reading is {fmt_dur(u.projected_age)} old — "
+                                  + " · ".join(bits)))
     if in_grace(state):
         lines.append(a.dim(f"  post-swap grace: {fmt_dur(state['grace_until'] - now())} left — "
                            "burn estimate and early rotation paused while agents re-prime"))
@@ -2055,9 +2145,16 @@ def cmd_watch(cfg: Cfg, a: Ansi) -> int:
     paused = not cfg.rotate
     notice = ""
     tty_out = sys.stdout.isatty()
+    # the fastest cadence the usage endpoint has been seen to tolerate this
+    # run: starts at FAST_POLL_S and doubles whenever a poll of the active
+    # account is answered with a 429, up to --interval (fast poll off).  It
+    # never relaxes within a run; a restart probes again.
+    poll_floor = float(FAST_POLL_S)
+    poll_in_force = float(cfg.interval)
+    throttled_at = None               # the cadence the endpoint last refused
 
     def rescan():
-        nonlocal usages, next_scan, next_active_poll
+        nonlocal usages, next_scan, next_active_poll, poll_in_force
         accounts[:] = list_accounts(cfg)
         fresh = scan_accounts(cfg, accounts, state.get("active"))
         if state.get("active") is None and oauth_of(read_json(cfg.live_path)):
@@ -2067,7 +2164,8 @@ def cmd_watch(cfg: Cfg, a: Ansi) -> int:
         record_samples(state, usages)
         save_state(cfg, state)
         next_scan = now() + cfg.scan
-        next_active_poll = now() + poll_interval()
+        poll_in_force = poll_interval()
+        next_active_poll = now() + poll_in_force
 
     def remember_good(fresh: dict) -> None:
         for name, u in fresh.items():
@@ -2075,22 +2173,30 @@ def cmd_watch(cfg: Cfg, a: Ansi) -> int:
                 last_good[name] = u
 
     def poll_interval() -> float:
-        """Poll the active account every 15 s while a limit is under ten
-        minutes away at the current burn, else at --interval."""
+        """Poll the active account faster while a limit is under ten minutes
+        away at the current burn, else at --interval.  "Faster" is FAST_POLL_S
+        or the floor the endpoint's own 429s have raised it to."""
         name = state.get("active")
         u = usages.get(name) if name else None
         if u and not u.error:
             r = runway_s(state, name, u, cfg)
             if r is not None and r < FAST_POLL_BELOW_S:
-                return FAST_POLL_S
-        return cfg.interval
+                return max(poll_floor, float(FAST_POLL_S))
+        return float(cfg.interval)
 
     def poll_active():
-        nonlocal next_active_poll
+        nonlocal next_active_poll, poll_floor, poll_in_force, throttled_at
         name = state.get("active")
         key = name or LIVE_PSEUDO
         if oauth_of(read_json(cfg.live_path)):
-            usages[key] = usage_for(cfg.live_path)
+            usages[key] = usage_for(cfg.live_path, backoff_cap=cfg.scan)
+            if usages[key].throttled and poll_in_force < cfg.interval:
+                # the endpoint refused the fast cadence: back off to double it
+                # and stay there for the rest of the run.  A 429 answered at
+                # the base interval (every retry inside a blackout is one)
+                # says nothing about the fast cadence, so it leaves the floor.
+                throttled_at = poll_in_force
+                poll_floor = min(float(cfg.interval), max(poll_floor, 2 * poll_in_force))
             remember_good({key: usages[key]})
             if name:
                 record_samples(state, {name: usages[key]})
@@ -2099,7 +2205,8 @@ def cmd_watch(cfg: Cfg, a: Ansi) -> int:
                 maybe_signal_reset(cfg, state, name, usages[key])
                 maybe_signal_expected(cfg, state, name, usages[key], not paused)
                 save_state(cfg, state)
-        next_active_poll = now() + poll_interval()
+        poll_in_force = poll_interval()
+        next_active_poll = now() + poll_in_force
 
     def maybe_rotate():
         nonlocal notice, next_scan
@@ -2111,13 +2218,18 @@ def cmd_watch(cfg: Cfg, a: Ansi) -> int:
         live = usages.get(active)
         # A read that fails is what a throttled account does; fall back to the
         # last good snapshot rather than sitting on an account we cannot see.
+        # Either way the reading is projected forward by its age at the
+        # measured burn: what was read is a lower bound on where the account
+        # is now, and this runs every tick, so the swap fires at the predicted
+        # moment rather than at whichever poll happens to land after it.
         u_act, age = rotation_usage(last_good, active, live)
+        if u_act is not None:
+            u_act = projected_usage(state, active, u_act)
         reason = is_exhausted(u_act, cfg)
-        if reason is None and age is None:
+        if reason is None:
             reason = about_to_exhaust(state, active, u_act, cfg)
         if reason and age is not None:
-            reason += (f" (last good read {fmt_dur(age)} ago) · "
-                       f"usage read: {live.error if live else 'unavailable'}")
+            reason += f" · usage read: {live.error if live else 'unavailable'}"
         if not reason:
             clear_hold_notice()
             if cfg.preempt:
@@ -2192,20 +2304,26 @@ def cmd_watch(cfg: Cfg, a: Ansi) -> int:
                 else a.green(f"auto-rotate at session≥{cfg.threshold:.0f}% / {govern} "
                              f"or ≤{cfg.lead:.0f}s from a limit{early}"))
         head = a.bold(f"ccroll {CCROLL_VERSION}") + a.dim("  ·  ") + mode + a.dim("  ·  ") + fmt_clock(now())
+        if poll_floor > FAST_POLL_S:
+            fast = ("off" if poll_floor >= cfg.interval else f"{poll_floor:.0f} s")
+            head += a.dim("  ·  ") + a.yellow(
+                f"fast poll {fast} (endpoint throttled at {throttled_at:.0f} s)")
         lines = [head, ""]
-        lines += render_table(a, build_rows(cfg, state, accounts,
-                                            merged_view(usages, last_good)), label)
-        if active and usages.get(active):
-            lines += [""] + render_burn(a, state, active, usages[active], label)
-            soon = about_to_exhaust(state, active, usages[active], cfg)
+        view = merged_view(usages, last_good, state)
+        lines += render_table(a, build_rows(cfg, state, accounts, view), label)
+        if active and view.get(active) and not view[active].error:
+            # the burn panel and the early-rotation warning read the same
+            # projected figures rotation acts on, blackout or not
+            lines += [""] + render_burn(a, state, active, view[active], label)
+            soon = about_to_exhaust(state, active, view[active], cfg)
             if soon:
                 lines.append(a.red(f"  ⚠ rotating early: {soon}"))
             elif poll_interval() != cfg.interval:
-                near = nearest_limit(state, active, usages[active], cfg)
+                near = nearest_limit(state, active, view[active], cfg)
                 what = (f"{near[0]} limit in ≈{fmt_dur(near[3])} at {near[2]:.0f}%/h"
                         if near else f"limit under {FAST_POLL_BELOW_S // 60} min away")
-                lines.append(a.yellow(f"  ⚠ {what} — polling every {FAST_POLL_S} s"))
-            lines += [""] + render_fleet(a, state, active, usages[active], cfg,
+                lines.append(a.yellow(f"  ⚠ {what} — polling every {poll_interval():.0f} s"))
+            lines += [""] + render_fleet(a, state, active, view[active], cfg,
                                          readable_accounts(accounts, usages), label, usages=usages)
         target = pick_target(usages, cfg, exclude=active, preload=preload_estimate(state))
         if target:
