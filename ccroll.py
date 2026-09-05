@@ -640,6 +640,48 @@ def active_burn(state: dict, name: str, key: str) -> float | None:
     return rate
 
 
+def window_eta(state: dict, name: str, key: str, pct: float | None):
+    """The one place a window's burn is turned into a decision: (rate, fit,
+    eta, provisional).  `rate` is the conservative estimate ccroll acts on
+    (active_burn), `fit` the plain least-squares slope for reference, `eta`
+    the seconds to 100% at `rate` (None: no estimate or negligible burn),
+    `provisional` whether the fit still covers a short span.  The dashboard,
+    the early-rotation rule and the runway gate all read this, so what is
+    shown is always what is acted on."""
+    series = state.get("samples", {}).get(name, {}).get(key, [])
+    fit = burn_fit(series)
+    if fit is None:
+        return None, None, None, False
+    rate = active_burn(state, name, key)
+    return rate, fit[0], eta_to_limit(pct, rate), fit[1] < BURN_SETTLED_SPAN_S
+
+
+def limit_etas(state: dict, name: str, u: Usage, cfg: Cfg) -> list:
+    """(key, label, pct, rate, eta) for every window that can trigger
+    rotation on the active account, in display order; `rate` is None when
+    the window has no burn estimate yet."""
+    windows = [("session", "session", u.session_pct), ("weekly", "weekly", u.weekly_pct)]
+    if cfg.mode == "scoped":
+        windows.append(("scoped", (u.scoped_label or "scoped").lower() + " weekly", u.scoped_pct))
+    out = []
+    for key, label, pct in windows:
+        if pct is None:
+            continue
+        rate, _, eta, _ = window_eta(state, name, key, pct)
+        out.append((key, label, pct, rate, eta))
+    return out
+
+
+def nearest_limit(state: dict, name: str, u: Usage, cfg: Cfg):
+    """The window closest to its limit at the current burn: (label, pct,
+    rate, eta), or None when no window has an estimate and a finite ETA."""
+    best = None
+    for _, label, pct, rate, eta in limit_etas(state, name, u, cfg):
+        if eta is not None and (best is None or eta < best[3]):
+            best = (label, pct, rate, eta)
+    return best
+
+
 def _fmt_eta_short(secs: float) -> str:
     return "<1m" if secs < 60 else f"{secs / 60:.0f}m"
 
@@ -650,14 +692,9 @@ def about_to_exhaust(state: dict, name: str, u: Usage | None, cfg: Cfg) -> str |
     Only the active account has a burn series; missing data never rotates."""
     if u is None or u.error or not name or name == LIVE_PSEUDO:
         return None
-    windows = [("session", "session", u.session_pct), ("weekly", "weekly", u.weekly_pct)]
-    if cfg.mode == "scoped":
-        windows.append(("scoped", (u.scoped_label or "scoped").lower() + " weekly", u.scoped_pct))
-    for key, label, pct in windows:
-        if pct is None or pct < EARLY_MIN_PCT:
+    for _, label, pct, rate, eta in limit_etas(state, name, u, cfg):
+        if pct < EARLY_MIN_PCT:
             continue
-        rate = active_burn(state, name, key)
-        eta = eta_to_limit(pct, rate)
         if eta is not None and eta <= cfg.lead:
             return f"{label} {pct:.0f}% · ≈{_fmt_eta_short(eta)} to limit at {rate:.0f}%/h"
     return None
@@ -732,18 +769,11 @@ def runway_s(state: dict, name: str, u: Usage, cfg: Cfg) -> float | None:
     """Seconds until the active account is expected to hit a limit at its
     current burn, across every window that can trigger rotation.  None when
     there is no burn estimate yet; inf when the burn is negligible."""
-    windows = [("session", u.session_pct), ("weekly", u.weekly_pct)]
-    if cfg.mode == "scoped":
-        windows.append(("scoped", u.scoped_pct))
     etas, fitted = [], False
-    for key, pct in windows:
-        if pct is None:
-            continue
-        rate = active_burn(state, name, key)
+    for _, _, _, rate, eta in limit_etas(state, name, u, cfg):
         if rate is None:
             continue
         fitted = True
-        eta = eta_to_limit(pct, rate)
         if eta is not None:
             etas.append(eta)
     if not fitted:
@@ -905,11 +935,9 @@ def render_burn(a: Ansi, state: dict, name: str, u: Usage | None, scoped_label: 
     for (label, pct, reset), key in zip(windows, keys):
         if pct is None:
             continue
-        series = state["samples"].get(name, {}).get(key, [])
-        fit = burn_fit(series)
-        rate, span = fit if fit else (None, 0.0)
-        provisional = fit is not None and span < BURN_SETTLED_SPAN_S
-        eta = eta_to_limit(pct, rate)
+        # the same conservative rate the rotation rules act on, so the ETA
+        # shown is the ETA ccroll will move on
+        rate, fit_rate, eta, provisional = window_eta(state, name, key, pct)
         reset_in = (reset - now()) if reset else None
         parts = [f"{pct:5.1f}%"]
         # fixed-width burn cell ("0000.0%/h") so rows stay aligned as the
@@ -932,7 +960,13 @@ def render_burn(a: Ansi, state: dict, name: str, u: Usage | None, scoped_label: 
         verdict = ""
         if eta is not None and reset_in is not None and reset_in > 0:
             verdict = a.green("✓ reset first") if reset_in < eta else a.red("⚠ limit first")
-        lines.append(f"  {label:<14}" + "  ·  ".join(parts) + ("  " + verdict if verdict else ""))
+        # when the sustained recent slope is what drives the figure, keep the
+        # plain fit visible so the smoothing is not a mystery
+        note = ""
+        if rate is not None and fit_rate is not None and rate > max(fit_rate, BURN_MIN_RATE) * 1.2:
+            note = a.dim(f"(fit {fit_rate:.1f}%/h)")
+        tail = "  ".join(x for x in (verdict, note) if x)
+        lines.append(f"  {label:<14}" + "  ·  ".join(parts) + ("  " + tail if tail else ""))
     return lines
 
 
@@ -1229,7 +1263,10 @@ def cmd_watch(cfg: Cfg, a: Ansi) -> int:
             if soon:
                 lines.append(a.red(f"  ⚠ rotating early: {soon}"))
             elif poll_interval() != cfg.interval:
-                lines.append(a.yellow(f"  ⚠ limit under {FAST_POLL_BELOW_S // 60} min away — polling every {FAST_POLL_S} s"))
+                near = nearest_limit(state, active, usages[active], cfg)
+                what = (f"{near[0]} limit in ≈{fmt_dur(near[3])} at {near[2]:.0f}%/h"
+                        if near else f"limit under {FAST_POLL_BELOW_S // 60} min away")
+                lines.append(a.yellow(f"  ⚠ {what} — polling every {FAST_POLL_S} s"))
         target = pick_target(usages, cfg, exclude=active)
         if target:
             lines += ["", a.dim("next in line: ") + a.green(target)

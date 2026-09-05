@@ -116,7 +116,7 @@ Tuning: `--threshold`, `--scoped-threshold`, `--lead` (seconds of burn-predicted
 
 Every duration — resets, limit ETAs, token expiries — is shown in a fixed `0d 00h 00m` format with days, hours and minutes each in their own color (zero-value leading units dimmed), so remaining time reads in a single glance.
 
-The dashboard samples the active account's three windows (session / weekly-all / weekly-scoped) once per minute and fits a least-squares slope over the last 45 minutes. From that it shows the burn rate (%/h), the estimated time until each limit is hit, the time until each window resets — and which comes first (`✓ reset first` / `⚠ limit first`). A window reset clears its series automatically. A first estimate appears after ~2 minutes (three samples) and is shown dimmed until the fit covers 8 minutes; a session can burn out in 10 minutes, so an early rough number beats none.
+The dashboard samples the active account's three windows (session / weekly-all / weekly-scoped) once per minute and fits a least-squares slope over the last 45 minutes. The burn rate shown (%/h) and the time-to-limit derived from it are the same pessimistic estimate the rotation rules act on (the larger of that fit and the sustained recent slope; when the two differ by more than a fifth the plain fit is shown alongside in dim text), so the dashboard never says 20 minutes while ccroll acts on 7. It also shows the time until each window resets — and which comes first (`✓ reset first` / `⚠ limit first`). A window reset clears its series automatically. A first estimate appears after ~2 minutes (three samples) and is shown dimmed until the fit covers 8 minutes; a session can burn out in 10 minutes, so an early rough number beats none.
 
 ## What ccroll writes, and where
 
