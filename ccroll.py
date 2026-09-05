@@ -1014,10 +1014,10 @@ def maybe_signal_threshold(cfg: Cfg, state: dict, name: str, u: "Usage | None") 
     indistinguishable noise."""
     if not cfg.signal or u is None or u.error or not name or name == LIVE_PSEUDO:
         return
-    pcts = [u.session_pct, u.weekly_pct]
+    pcts = [(u.session_pct, u.session_reset), (u.weekly_pct, u.weekly_reset)]
     if cfg.mode == "scoped":
-        pcts.append(u.scoped_pct)
-    live = [p for p in pcts if p is not None]
+        pcts.append((u.scoped_pct, u.scoped_reset))
+    live = [effective_pct(p, r) for p, r in pcts if p is not None]
     if not live:
         return
     pct = max(live)
@@ -1059,18 +1059,33 @@ def check_auto_continue(cfg: Cfg) -> str | None:
 
 
 # --- rotation policy ------------------------------------------------------------
-def window_spent(pct: float | None, reset: float | None, threshold: float,
-                 t: float | None = None) -> bool:
-    """Is this window over its threshold *and* still in force?
+def effective_pct(pct: float | None, reset: float | None,
+                  t: float | None = None) -> float:
+    """The utilisation to make decisions on, which is 0 once the window has
+    rolled over.
 
     A percentage whose reset time has already passed is stale data: the
-    window has rolled over and the endpoint simply has not caught up (an
-    account reported at 100% with an expired reset reads 0% a minute later).
-    Treating that as spent strands the account outside the candidate pool
-    exactly when it has become the best one available."""
-    if (pct or 0) < threshold:
-        return False
-    return not reset or reset > (now() if t is None else t)
+    window has reset and the endpoint simply has not caught up (an account
+    reported at 100% with an expired reset reads 0% a minute later).  Every
+    rule that compares a utilisation against a threshold must go through
+    here, or a rolled-over account is judged on a number that no longer
+    exists — which is exactly how ops@ was dropped from the candidate pool
+    85 seconds after its session window reset, while it was the single most
+    perishable account in the fleet.
+
+    Display code deliberately does NOT use this: the dashboard should show
+    what the endpoint actually reported."""
+    if pct is None:
+        return 0.0
+    if reset and reset <= (now() if t is None else t):
+        return 0.0
+    return pct
+
+
+def window_spent(pct: float | None, reset: float | None, threshold: float,
+                 t: float | None = None) -> bool:
+    """Is this window over its threshold *and* still in force?"""
+    return effective_pct(pct, reset, t) >= threshold
 
 
 def is_exhausted(u: Usage | None, cfg: Cfg) -> str | None:
@@ -1157,13 +1172,16 @@ def limit_etas(state: dict, name: str, u: Usage, cfg: Cfg) -> list:
     """(key, label, pct, rate, eta) for every window that can trigger
     rotation on the active account, in display order; `rate` is None when
     the window has no burn estimate yet."""
-    windows = [("session", "session", u.session_pct), ("weekly", "weekly", u.weekly_pct)]
+    windows = [("session", "session", u.session_pct, u.session_reset),
+               ("weekly", "weekly", u.weekly_pct, u.weekly_reset)]
     if cfg.mode == "scoped":
-        windows.append(("scoped", (u.scoped_label or "scoped").lower() + " weekly", u.scoped_pct))
+        windows.append(("scoped", (u.scoped_label or "scoped").lower() + " weekly",
+                        u.scoped_pct, u.scoped_reset))
     out = []
-    for key, label, pct in windows:
+    for key, label, pct, reset in windows:
         if pct is None:
             continue
+        pct = effective_pct(pct, reset)
         rate, _, eta, _ = window_eta(state, name, key, pct)
         out.append((key, label, pct, rate, eta))
     return out
@@ -1179,15 +1197,16 @@ def eta_to_threshold(pct: float | None, rate: float | None, threshold: float) ->
 
 def threshold_etas(state: dict, name: str, u: Usage, cfg: Cfg) -> list:
     """(key, label, pct, rate, eta-to-threshold) per rotating window."""
-    windows = [("session", "session", u.session_pct, cfg.threshold),
-               ("weekly", "weekly", u.weekly_pct, 99.5)]
+    windows = [("session", "session", u.session_pct, u.session_reset, cfg.threshold),
+               ("weekly", "weekly", u.weekly_pct, u.weekly_reset, 99.5)]
     if cfg.mode == "scoped":
         windows.append(("scoped", (u.scoped_label or "scoped").lower() + " weekly",
-                        u.scoped_pct, cfg.scoped_threshold))
+                        u.scoped_pct, u.scoped_reset, cfg.scoped_threshold))
     out = []
-    for key, label, pct, thr in windows:
+    for key, label, pct, reset, thr in windows:
         if pct is None:
             continue
+        pct = effective_pct(pct, reset)
         rate = active_burn(state, name, key)
         out.append((key, label, pct, rate, eta_to_threshold(pct, rate, thr)))
     return out
@@ -1285,15 +1304,16 @@ def pick_target(usages: dict, cfg: Cfg, exclude: str | None, t: float | None = N
         name, u = item
         pct, reset = governing_window(u, cfg)
         rate = perish_rate(pct, reset, t)
-        return (rate is not None, -(rate or 0), pct or 0, u.session_pct or 0, name)
+        return (rate is not None, -(rate or 0), effective_pct(pct, reset, t),
+                effective_pct(u.session_pct, u.session_reset, t), name)
 
-    strict, ok = candidates(usages, cfg, exclude, preload)
+    strict, ok = candidates(usages, cfg, exclude, preload, t)
     pool = strict or ok
     return min(pool, key=key)[0] if pool else None
 
 
 def candidates(usages: dict, cfg: Cfg, exclude: str | None,
-               preload: dict | None = None) -> tuple[list, list]:
+               preload: dict | None = None, t: float | None = None) -> tuple[list, list]:
     """(strict, ok): accounts that could take over.  `ok` is anyone not spent;
     `strict` is the subset comfortably clear of every threshold (hysteresis)
     and, when the preload is known, of what the swap itself will cost."""
@@ -1301,25 +1321,33 @@ def candidates(usages: dict, cfg: Cfg, exclude: str | None,
           if n != exclude and n != LIVE_PSEUDO
           and u and not u.error and u.session_pct is not None
           and not is_exhausted(u, cfg)]
-    strict = [(n, u) for n, u in ok if comfortable(u, cfg, preload)]
+    strict = [(n, u) for n, u in ok if comfortable(u, cfg, preload, t)]
     return strict, ok
 
 
-def comfortable(u: Usage, cfg: Cfg, preload: dict | None = None) -> bool:
+def comfortable(u: Usage, cfg: Cfg, preload: dict | None = None,
+                t: float | None = None) -> bool:
     """Comfortably clear of every threshold — and, once the preload has been
     measured, with enough headroom that the swap itself (every agent
-    re-priming its context on the new account) leaves room to work."""
-    if not ((u.session_pct or 0) < cfg.threshold - 15
-            and (u.weekly_pct or 0) < 95
-            and (cfg.mode != "scoped" or (u.scoped_pct or 0) < 90)):
+    re-priming its context on the new account) leaves room to work.
+
+    Every figure here is the *effective* utilisation, so a window that has
+    rolled over counts as free rather than as whatever the last scan saw.
+    Promoting a stale account is safe because `verified_target` re-reads the
+    account it picks and rejects it if the fresh read says it is spent."""
+    sess = effective_pct(u.session_pct, u.session_reset, t)
+    week = effective_pct(u.weekly_pct, u.weekly_reset, t)
+    scoped = effective_pct(u.scoped_pct, u.scoped_reset, t)
+    if not (sess < cfg.threshold - 15 and week < 95
+            and (cfg.mode != "scoped" or scoped < 90)):
         return False
     if preload:
         need_s = preload.get("session")
-        if need_s is not None and 100 - (u.session_pct or 0) <= 1.2 * need_s + 5:
+        if need_s is not None and 100 - sess <= 1.2 * need_s + 5:
             return False
-        gov_pct = u.weekly_pct if cfg.mode == "weekly" else u.scoped_pct
+        gov_pct = week if cfg.mode == "weekly" else scoped
         need_g = preload_cost(preload, cfg)
-        if need_g is not None and 100 - (gov_pct or 0) <= 1.2 * need_g + 3:
+        if need_g is not None and 100 - gov_pct <= 1.2 * need_g + 3:
             return False
     return True
 
