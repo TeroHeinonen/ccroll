@@ -43,6 +43,7 @@ import re
 import select
 import shutil
 import signal
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -87,6 +88,8 @@ BURN_MIN_SAMPLES = 3
 BURN_MIN_SPAN_S = 90            # 3 polls at the 60s default: a figure after ~2 min
 BURN_SETTLED_SPAN_S = 8 * 60    # shorter fits are shown dimmed as provisional
 BURN_MIN_RATE = 0.05            # %/h below this shows as idle
+PRELOAD_KEEP = 5                # preload measurements kept for the median
+PRELOAD_MEASURE_MAX_S = 300     # after the grace: measure raw if no fit appears within this
 EARLY_MIN_PCT = 50              # burn-based early rotation only from here up: below it an
                                 # ETA under the lead would need >1000%/h, which is noise
                                 # (the post-swap re-prime spike), not a sustained rate
@@ -271,6 +274,15 @@ class Cfg:
         self.preempt = not getattr(args, "no_preempt", False)
         self.preempt_runway = float(getattr(args, "preempt_runway", 3.0)) * 3600
         self.touch = bool(getattr(args, "touch", False))
+        # post-swap grace: every running agent re-primes its context on the
+        # new account in the first minutes after a swap (the *preload*).  For
+        # this long burn-based rotation and pre-emption are off and the burn
+        # series is ignored; the static thresholds still apply.  The preload
+        # is measured at the end of the grace and used to (a) skip candidates
+        # it alone would exhaust and (b) refuse pre-emption when a swap costs
+        # more than --preempt-max-cost percent of the governing window.
+        self.grace = float(getattr(args, "grace", 300))
+        self.preempt_max_cost = float(getattr(args, "preempt_max_cost", 5.0))
         # which weekly limit governs exhaustion + next-account choice:
         # "scoped" = the per-model weekly limit (Fable on current Max plans),
         # "weekly" = the all-models weekly limit.
@@ -494,6 +506,8 @@ def load_state(cfg: Cfg) -> dict:
     state.setdefault("samples", {})
     state.setdefault("events", [])
     state.setdefault("last_swap", 0)
+    state.setdefault("grace_until", 0)
+    state.setdefault("preload", [])
     return state
 
 
@@ -525,6 +539,21 @@ def reset_samples(state: dict, name: str) -> None:
     fast it will burn now, and the first post-swap poll shows a one-time
     jump (every running agent re-primes its context) that is not a rate."""
     state.setdefault("samples", {}).pop(name, None)
+
+
+def burn_series(state: dict, name: str, key: str) -> list:
+    """The samples the burn estimate may use.  For the active account,
+    samples taken during the post-swap grace are left out: they record the
+    preload (every agent re-priming its context), not a rate."""
+    series = state.get("samples", {}).get(name, {}).get(key, [])
+    if name == state.get("active"):
+        cutoff = state.get("grace_until", 0)
+        series = [s for s in series if s[0] >= cutoff]
+    return series
+
+
+def in_grace(state: dict, t: float | None = None) -> bool:
+    return (now() if t is None else t) < state.get("grace_until", 0)
 
 
 def burn_fit(series: list) -> tuple[float, float] | None:
@@ -562,9 +591,12 @@ def harvest(cfg: Cfg, state: dict) -> None:
     write_json_atomic(os.path.join(cfg.root, name, CRED_FILE), live)
 
 
-def do_swap(cfg: Cfg, state: dict, target: Account, reason: str) -> str:
+def do_swap(cfg: Cfg, state: dict, target: Account, reason: str,
+            snapshot: "Usage | None" = None) -> str:
     """Swap the live credentials to `target`. Returns the human-readable detail
-    ("left <prev>: <reason>") so callers can show the same text in notices."""
+    ("left <prev>: <reason>") so callers can show the same text in notices.
+    `snapshot` is the target's usage as last read: the preload is measured
+    against it at the end of the grace period."""
     old = oauth_of(read_json(cfg.live_path)) or {}
     prev = state.get("active")
     harvest(cfg, state)
@@ -582,7 +614,12 @@ def do_swap(cfg: Cfg, state: dict, target: Account, reason: str) -> str:
     write_json_atomic(cfg.live_path, creds)
     state["active"] = target.name
     state["last_swap"] = now()
+    state["grace_until"] = state["last_swap"] + cfg.grace
     reset_samples(state, target.name)
+    state["swap_snapshot"] = ({"name": target.name, "t": state["last_swap"],
+                               "session": snapshot.session_pct, "weekly": snapshot.weekly_pct,
+                               "scoped": snapshot.scoped_pct}
+                              if snapshot and not snapshot.error else None)
     detail = f"left {prev}: {reason}" if prev and prev != target.name else reason
     add_event(state, f"→ {target.name} ({detail})")
     save_state(cfg, state)
@@ -599,6 +636,66 @@ def do_swap(cfg: Cfg, state: dict, target: Account, reason: str) -> str:
         add_event(state, "re-asserted swap over a concurrent write")
         save_state(cfg, state)
     return detail
+
+
+def measure_preload(state: dict, usages: dict, cfg: Cfg) -> bool:
+    """Once per swap, after the grace: how much of each window the swap itself
+    cost — the jump since the swap minus the sustained burn over that time
+    (raw deltas when no fit has appeared within PRELOAD_MEASURE_MAX_S of the
+    grace ending).  Skipped if a window reset in between.  Returns True when
+    a measurement was recorded."""
+    snap = state.get("swap_snapshot")
+    name = state.get("active")
+    if not snap or snap.get("name") != name or in_grace(state):
+        return False
+    u = usages.get(name)
+    if u is None or u.error:
+        return False
+    t = now()
+    fit = burn_fit(burn_series(state, name, "session"))
+    if fit is None and t < state.get("grace_until", 0) + PRELOAD_MEASURE_MAX_S:
+        return False                      # give the post-grace fit a chance to settle
+    elapsed_h = (t - snap["t"]) / 3600.0
+    out = {"t": t, "name": name}
+    for key, pct in (("session", u.session_pct), ("weekly", u.weekly_pct), ("scoped", u.scoped_pct)):
+        before = snap.get(key)
+        if pct is None or before is None:
+            out[key] = None
+            continue
+        delta = pct - before
+        if delta < -1:                    # the window reset since the swap
+            state["swap_snapshot"] = None
+            return False
+        rate = active_burn(state, name, key) or 0.0
+        out[key] = round(max(0.0, delta - rate * elapsed_h), 1)
+    state["swap_snapshot"] = None
+    state["preload"] = (state.get("preload", []) + [out])[-PRELOAD_KEEP:]
+    label = (u.scoped_label or "scoped").lower()
+    parts = [f"session +{out['session']:.0f}%"] if out.get("session") is not None else []
+    if out.get("scoped") is not None:
+        parts.append(f"{label} +{out['scoped']:.0f}%")
+    add_event(state, f"preload on {name}: " + " · ".join(parts))
+    return True
+
+
+def preload_estimate(state: dict) -> dict | None:
+    """Median of the recent preload measurements per window ({session,
+    weekly, scoped, n}), or None until one exists."""
+    rows = state.get("preload") or []
+    if not rows:
+        return None
+    est = {"n": len(rows)}
+    for key in ("session", "weekly", "scoped"):
+        vals = sorted(r[key] for r in rows if r.get(key) is not None)
+        est[key] = statistics.median(vals) if vals else None
+    return est
+
+
+def preload_cost(preload: dict | None, cfg: Cfg) -> float | None:
+    """What a swap costs on the governing weekly window, in percent."""
+    if not preload:
+        return None
+    return preload.get("weekly" if cfg.mode == "weekly" else "scoped")
 
 
 # --- rotation policy ------------------------------------------------------------
@@ -624,8 +721,9 @@ def active_burn(state: dict, name: str, key: str) -> float | None:
     lags.  "Sustained" means the smaller of the last two step slopes: a
     single jump between two polls (the re-prime after a swap) does not count
     until the next poll confirms it.  None until there is a fit at all;
-    the series restarts at every swap, so a fit exists after ~2 minutes."""
-    series = state.get("samples", {}).get(name, {}).get(key, [])
+    the series restarts at every swap and the post-swap grace is skipped,
+    so a fit exists about 2 minutes after the grace ends."""
+    series = burn_series(state, name, key)
     fit = burn_fit(series)
     if fit is None:
         return None
@@ -648,7 +746,7 @@ def window_eta(state: dict, name: str, key: str, pct: float | None):
     `provisional` whether the fit still covers a short span.  The dashboard,
     the early-rotation rule and the runway gate all read this, so what is
     shown is always what is acted on."""
-    series = state.get("samples", {}).get(name, {}).get(key, [])
+    series = burn_series(state, name, key)
     fit = burn_fit(series)
     if fit is None:
         return None, None, None, False
@@ -690,7 +788,7 @@ def about_to_exhaust(state: dict, name: str, u: Usage | None, cfg: Cfg) -> str |
     """Burn-based early exhaustion for the active account: the reason it is
     about to hit a limit within cfg.lead seconds at its current burn, or None.
     Only the active account has a burn series; missing data never rotates."""
-    if u is None or u.error or not name or name == LIVE_PSEUDO:
+    if u is None or u.error or not name or name == LIVE_PSEUDO or in_grace(state):
         return None
     for _, label, pct, rate, eta in limit_etas(state, name, u, cfg):
         if pct < EARLY_MIN_PCT:
@@ -725,7 +823,8 @@ def perish_rate(pct: float | None, reset: float | None, t: float | None = None) 
     return (100.0 - (pct or 0)) / hours
 
 
-def pick_target(usages: dict, cfg: Cfg, exclude: str | None, t: float | None = None) -> str | None:
+def pick_target(usages: dict, cfg: Cfg, exclude: str | None, t: float | None = None,
+                preload: dict | None = None) -> str | None:
     """The account whose governing weekly headroom is most perishable.
 
     Order: accounts whose weekly window is not open come first (spending
@@ -743,26 +842,41 @@ def pick_target(usages: dict, cfg: Cfg, exclude: str | None, t: float | None = N
         rate = perish_rate(pct, reset, t)
         return (rate is not None, -(rate or 0), pct or 0, u.session_pct or 0, name)
 
-    strict, ok = candidates(usages, cfg, exclude)
+    strict, ok = candidates(usages, cfg, exclude, preload)
     pool = strict or ok
     return min(pool, key=key)[0] if pool else None
 
 
-def candidates(usages: dict, cfg: Cfg, exclude: str | None) -> tuple[list, list]:
+def candidates(usages: dict, cfg: Cfg, exclude: str | None,
+               preload: dict | None = None) -> tuple[list, list]:
     """(strict, ok): accounts that could take over.  `ok` is anyone not spent;
-    `strict` is the subset comfortably clear of every threshold (hysteresis)."""
+    `strict` is the subset comfortably clear of every threshold (hysteresis)
+    and, when the preload is known, of what the swap itself will cost."""
     ok = [(n, u) for n, u in usages.items()
           if n != exclude and n != LIVE_PSEUDO
           and u and not u.error and u.session_pct is not None
           and not is_exhausted(u, cfg)]
-    strict = [(n, u) for n, u in ok if comfortable(u, cfg)]
+    strict = [(n, u) for n, u in ok if comfortable(u, cfg, preload)]
     return strict, ok
 
 
-def comfortable(u: Usage, cfg: Cfg) -> bool:
-    return ((u.session_pct or 0) < cfg.threshold - 15
+def comfortable(u: Usage, cfg: Cfg, preload: dict | None = None) -> bool:
+    """Comfortably clear of every threshold — and, once the preload has been
+    measured, with enough headroom that the swap itself (every agent
+    re-priming its context on the new account) leaves room to work."""
+    if not ((u.session_pct or 0) < cfg.threshold - 15
             and (u.weekly_pct or 0) < 95
-            and (cfg.mode != "scoped" or (u.scoped_pct or 0) < 90))
+            and (cfg.mode != "scoped" or (u.scoped_pct or 0) < 90)):
+        return False
+    if preload:
+        need_s = preload.get("session")
+        if need_s is not None and 100 - (u.session_pct or 0) <= 1.2 * need_s + 5:
+            return False
+        gov_pct = u.weekly_pct if cfg.mode == "weekly" else u.scoped_pct
+        need_g = preload_cost(preload, cfg)
+        if need_g is not None and 100 - (gov_pct or 0) <= 1.2 * need_g + 3:
+            return False
+    return True
 
 
 def runway_s(state: dict, name: str, u: Usage, cfg: Cfg) -> float | None:
@@ -795,21 +909,26 @@ def preempt_target(cfg: Cfg, state: dict, usages: dict, active: str,
     Gates: a burn estimate must exist and give the active account more than
     --preempt-runway of headroom (when sessions bind, runway is short and a
     pre-emptive swap would only add a cache re-prime); the active window must
-    be open (a touch or reset is still taking effect); and no swap in the
-    last PREEMPT_MIN_GAP_S."""
+    be open (a touch or reset is still taking effect); no swap in the last
+    PREEMPT_MIN_GAP_S and the post-swap grace over; and the measured preload
+    on the governing window must not exceed --preempt-max-cost."""
     t = now() if t is None else t
     u = usages.get(active)
     if u is None or u.error or active == LIVE_PSEUDO:
         return None
-    if t - state.get("last_swap", 0) < PREEMPT_MIN_GAP_S:
+    if t - state.get("last_swap", 0) < PREEMPT_MIN_GAP_S or in_grace(state, t):
         return None
+    preload = preload_estimate(state)
+    cost = preload_cost(preload, cfg)
+    if cost is not None and cost > cfg.preempt_max_cost:
+        return None                      # a swap costs more than it can save
     a_pct, a_reset = governing_window(u, cfg)
     if perish_rate(a_pct, a_reset, t) is None:
         return None                      # our own window is not open yet
     runway = runway_s(state, active, u, cfg)
     if runway is None or runway <= cfg.preempt_runway:
         return None
-    strict, _ = candidates(usages, cfg, exclude=active)
+    strict, _ = candidates(usages, cfg, exclude=active, preload=preload)
     label = scoped_label_of(usages).lower() if cfg.mode == "scoped" else "weekly"
     if cfg.touch:
         fresh = [n for n, c in strict if perish_rate(*governing_window(c, cfg), t) is None]
@@ -836,7 +955,8 @@ def target_reason(u: Usage, cfg: Cfg, label: str) -> str:
             f"· {u.session_pct or 0:.0f}% session")
 
 
-def verified_target(cfg: Cfg, usages: dict, active: str | None) -> str | None:
+def verified_target(cfg: Cfg, usages: dict, active: str | None,
+                    preload: dict | None = None) -> str | None:
     """pick_target, but with the choice confirmed against a fresh read before we
     commit to it.  Fleet data can be up to `--scan` seconds old, and an account
     may have been consumed elsewhere in that time; never swap onto one that is
@@ -844,7 +964,7 @@ def verified_target(cfg: Cfg, usages: dict, active: str | None) -> str | None:
     skip: set[str] = set()
     for _ in range(MAX_TARGET_TRIES):
         pool = {n: u for n, u in usages.items() if n not in skip}
-        target = pick_target(pool, cfg, exclude=active)
+        target = pick_target(pool, cfg, exclude=active, preload=preload)
         if not target:
             return None
         fresh = usage_for(get_account(cfg, target).cred_path)
@@ -967,6 +1087,19 @@ def render_burn(a: Ansi, state: dict, name: str, u: Usage | None, scoped_label: 
             note = a.dim(f"(fit {fit_rate:.1f}%/h)")
         tail = "  ".join(x for x in (verdict, note) if x)
         lines.append(f"  {label:<14}" + "  ·  ".join(parts) + ("  " + tail if tail else ""))
+    if in_grace(state):
+        lines.append(a.dim(f"  post-swap grace: {fmt_dur(state['grace_until'] - now())} left — "
+                           "burn estimate and early rotation paused while agents re-prime"))
+    est = preload_estimate(state)
+    if est:
+        bits = []
+        if est.get("session") is not None:
+            bits.append(f"session {est['session']:.0f}%")
+        if est.get("scoped") is not None:
+            bits.append(f"{scoped_label.lower()} {est['scoped']:.0f}%")
+        elif est.get("weekly") is not None:
+            bits.append(f"weekly {est['weekly']:.0f}%")
+        lines.append(a.dim("  swap cost ≈ " + " · ".join(bits) + f" (n={est['n']})"))
     return lines
 
 
@@ -1116,7 +1249,7 @@ def cmd_status(cfg: Cfg, a: Ansi) -> int:
         print()
         for line in render_burn(a, state, active, usages[active], label):
             print(line)
-    target = pick_target(usages, cfg, exclude=active)
+    target = pick_target(usages, cfg, exclude=active, preload=preload_estimate(state))
     if target:
         u = usages[target]
         print()
@@ -1179,6 +1312,7 @@ def cmd_watch(cfg: Cfg, a: Ansi) -> int:
             usages[key] = usage_for(cfg.live_path)
             if name:
                 record_samples(state, {name: usages[key]})
+                measure_preload(state, usages, cfg)
                 save_state(cfg, state)
         next_active_poll = now() + poll_interval()
 
@@ -1195,7 +1329,7 @@ def cmd_watch(cfg: Cfg, a: Ansi) -> int:
             if cfg.preempt:
                 maybe_preempt(active)
             return
-        target = verified_target(cfg, usages, active)
+        target = verified_target(cfg, usages, active, preload_estimate(state))
         if not target:
             # everyone is spent: hold position and rescan the moment the first
             # account's binding limits have reset (plus a small settle buffer)
@@ -1209,7 +1343,7 @@ def cmd_watch(cfg: Cfg, a: Ansi) -> int:
                 notice = "active account exhausted but no fallback has headroom"
             return
         try:
-            detail = do_swap(cfg, state, get_account(cfg, target), reason)
+            detail = do_swap(cfg, state, get_account(cfg, target), reason, usages.get(target))
             monitor.note_own_write()
             notice = f"rotated to {target} ({detail})"
             poll_active()
@@ -1230,12 +1364,12 @@ def cmd_watch(cfg: Cfg, a: Ansi) -> int:
         if fresh.error:
             return
         usages[target] = fresh
-        if is_exhausted(fresh, cfg) or not comfortable(fresh, cfg):
+        if is_exhausted(fresh, cfg) or not comfortable(fresh, cfg, preload_estimate(state)):
             return
         if preempt_target(cfg, state, usages, active) != choice:
             return                        # the fresh read changed the picture
         try:
-            detail = do_swap(cfg, state, get_account(cfg, target), why)
+            detail = do_swap(cfg, state, get_account(cfg, target), why, fresh)
             monitor.note_own_write()
             notice = f"moved early to {target} ({detail})"
             poll_active()
@@ -1267,7 +1401,7 @@ def cmd_watch(cfg: Cfg, a: Ansi) -> int:
                 what = (f"{near[0]} limit in ≈{fmt_dur(near[3])} at {near[2]:.0f}%/h"
                         if near else f"limit under {FAST_POLL_BELOW_S // 60} min away")
                 lines.append(a.yellow(f"  ⚠ {what} — polling every {FAST_POLL_S} s"))
-        target = pick_target(usages, cfg, exclude=active)
+        target = pick_target(usages, cfg, exclude=active, preload=preload_estimate(state))
         if target:
             lines += ["", a.dim("next in line: ") + a.green(target)
                       + a.dim(f"  ({target_reason(usages[target], cfg, label)})")]
@@ -1318,10 +1452,11 @@ def cmd_watch(cfg: Cfg, a: Ansi) -> int:
                     paused = not paused
                     notice = "auto-rotation paused" if paused else "auto-rotation resumed"
                 elif key == "r":
-                    target = verified_target(cfg, usages, state.get("active"))
+                    target = verified_target(cfg, usages, state.get("active"), preload_estimate(state))
                     if target:
                         try:
-                            detail = do_swap(cfg, state, get_account(cfg, target), "manual (keypress)")
+                            detail = do_swap(cfg, state, get_account(cfg, target), "manual (keypress)",
+                                             usages.get(target))
                             monitor.note_own_write()
                             notice = f"rotated to {target} ({detail})"
                             poll_active()
@@ -1502,6 +1637,13 @@ def main(argv: list[str] | None = None) -> int:
     w.add_argument("--touch", action="store_true",
                    help="also open freshly reset weekly windows at once (one request there, "
                         "then move on); worth it only when a swap costs little quota")
+    w.add_argument("--grace", type=float, default=300, metavar="SECONDS",
+                   help="after a swap, ignore the burn and never rotate early or pre-empt for "
+                        "this long while every agent re-primes its context (default 300); "
+                        "the static thresholds still apply")
+    w.add_argument("--preempt-max-cost", type=float, default=5.0, metavar="PERCENT",
+                   help="skip pre-emption when the measured swap cost (preload) on the governing "
+                        "weekly window exceeds this (default 5)")
 
     sub.add_parser("status", help="one-shot usage table for all accounts")
     sub.add_parser("add", help="log account(s) in interactively; each is named by its own email",
