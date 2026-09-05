@@ -85,9 +85,9 @@ RESCAN_MIN_S = 30               # floor on any scheduled rescan, so a stale rese
                                 # can never turn the watch loop into a scan storm
 LAST_GOOD_MAX_AGE_S = 15 * 60   # how long a cached usage read stands in for a failed one
 USAGE_ERROR_COOLDOWN_S = 60     # back off this long on an account the endpoint throttles
-PREEMPT_MIN_GAP_S = 15 * 60     # never preempt within this long of any swap
 FRESH_PERISH_RATE = 97 / 168    # %/h an unopened weekly window "loses" by not starting
                                 # its 7-day clock: one full window per week
+TOUCH_REASON = "opens a fresh"  # prefix of the reason a --touch move carries
 FAST_POLL_BELOW_S = 10 * 60     # poll the active account faster once a limit is this close
 FAST_POLL_S = 15
 REFRESH_MARGIN_S = 180          # refresh an access token this close to expiry
@@ -562,6 +562,7 @@ def load_state(cfg: Cfg) -> dict:
     state.setdefault("events", [])
     state.setdefault("last_swap", 0)
     state.setdefault("grace_until", 0)
+    state.setdefault("touch_pending", False)   # a --touch happened; no more until a natural swap
     state.setdefault("preload", [])
     state.setdefault("signal_labels", {})
     state.setdefault("signal_crossed", [])
@@ -722,11 +723,13 @@ def harvest(cfg: Cfg, state: dict) -> None:
 
 
 def do_swap(cfg: Cfg, state: dict, target: Account, reason: str,
-            snapshot: "Usage | None" = None) -> str:
+            snapshot: "Usage | None" = None, preemptive: bool = False) -> str:
     """Swap the live credentials to `target`. Returns the human-readable detail
     ("left <prev>: <reason>") so callers can show the same text in notices.
     `snapshot` is the target's usage as last read: the preload is measured
-    against it at the end of the grace period."""
+    against it at the end of the grace period.  `preemptive` marks a move made
+    while the previous account still had headroom; a natural (exhaustion or
+    manual) swap ends the current cycle and re-arms --touch."""
     old = oauth_of(read_json(cfg.live_path)) or {}
     prev = state.get("active")
     harvest(cfg, state)
@@ -745,6 +748,10 @@ def do_swap(cfg: Cfg, state: dict, target: Account, reason: str,
     state["active"] = target.name
     state["last_swap"] = now()
     state["grace_until"] = state["last_swap"] + cfg.grace
+    if not preemptive:
+        state["touch_pending"] = False          # a natural swap starts a new cycle
+    elif reason.startswith(TOUCH_REASON):
+        state["touch_pending"] = True           # one touch per cycle
     reset_samples(state, target.name)
     state["swap_snapshot"] = ({"name": target.name, "t": state["last_swap"],
                                "session": snapshot.session_pct, "weekly": snapshot.weekly_pct,
@@ -1399,14 +1406,23 @@ def preempt_target(cfg: Cfg, state: dict, usages: dict, active: str,
     Gates: a burn estimate must exist and give the active account more than
     --preempt-runway of headroom (when sessions bind, runway is short and a
     pre-emptive swap would only add a cache re-prime); the active window must
-    be open (a touch or reset is still taking effect); no swap in the last
-    PREEMPT_MIN_GAP_S and the post-swap grace over; and the measured preload
-    on the governing window must not exceed --preempt-max-cost."""
+    be open (a touch or reset is still taking effect); the post-swap grace
+    must be over; and the measured preload on the governing window must not
+    exceed --preempt-max-cost.
+
+    There is no minimum interval between moves, and none is needed: a move
+    goes only to an account whose reset is strictly earlier than ours, and a
+    reset never changes while its window is open, so the account we left can
+    never be chosen again — targets descend in reset time and run out.  The
+    one path that could chain is --touch, since touching a window opens it
+    and the next fresh account inherits the target; that is held to one touch
+    per natural cycle (state["touch_pending"], cleared by the next
+    exhaustion-driven swap), which scales with the cycle instead of the clock."""
     t = now() if t is None else t
     u = usages.get(active)
     if u is None or u.error or active == LIVE_PSEUDO:
         return None
-    if t - state.get("last_swap", 0) < PREEMPT_MIN_GAP_S or in_grace(state, t):
+    if in_grace(state, t):
         return None
     preload = preload_estimate(state)
     cost = preload_cost(preload, cfg)
@@ -1420,10 +1436,10 @@ def preempt_target(cfg: Cfg, state: dict, usages: dict, active: str,
         return None
     strict, _ = candidates(usages, cfg, exclude=active, preload=preload)
     label = scoped_label_of(usages).lower() if cfg.mode == "scoped" else "weekly"
-    if cfg.touch:
+    if cfg.touch and not state.get("touch_pending"):
         fresh = [n for n, c in strict if perish_rate(*governing_window(c, cfg), t) is None]
         if fresh:
-            return min(fresh), f"opens a fresh {label} week"
+            return min(fresh), f"{TOUCH_REASON} {label} week"
     opened = [(governing_window(c, cfg)[1], n) for n, c in strict
               if perish_rate(*governing_window(c, cfg), t) is not None]
     if not opened:
@@ -1937,7 +1953,7 @@ def cmd_watch(cfg: Cfg, a: Ansi) -> int:
         if preempt_target(cfg, state, usages, active) != choice:
             return                        # the fresh read changed the picture
         try:
-            detail = do_swap(cfg, state, get_account(cfg, target), why, fresh)
+            detail = do_swap(cfg, state, get_account(cfg, target), why, fresh, preemptive=True)
             monitor.note_own_write()
             notice = f"moved early to {target} ({detail})"
             poll_active()
