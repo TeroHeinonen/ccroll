@@ -67,6 +67,8 @@ OAUTH_BETA = "oauth-2025-04-20"
 ANTHROPIC_VERSION = "2023-06-01"
 
 CRED_FILE = ".credentials.json"
+CONFIG_FILE = ".claude.json"     # Claude Code's global config (identity + history)
+MIN_CONFIG_KEYS = 3              # fewer than this and we assume a truncated read
 HTTP_TIMEOUT_S = 30
 # The token endpoint sits behind an edge rule that only serves the official
 # client signature: a default urllib UA gets a Cloudflare 403 (error 1010) and
@@ -255,10 +257,17 @@ class Account:
 class Cfg:
     def __init__(self, args):
         self.root = os.path.expanduser(getattr(args, "root", None) or "~/.claude-accounts")
-        live_dir = getattr(args, "claude_dir", None) or os.environ.get("CLAUDE_CONFIG_DIR") \
-            or os.path.join(os.path.expanduser("~"), ".claude")
+        explicit_dir = getattr(args, "claude_dir", None) or os.environ.get("CLAUDE_CONFIG_DIR")
+        live_dir = explicit_dir or os.path.join(os.path.expanduser("~"), ".claude")
         self.live_dir = os.path.expanduser(live_dir)
         self.live_path = os.path.join(self.live_dir, CRED_FILE)
+        # The global config sits INSIDE an explicit config dir, but at
+        # ~/.claude.json when none is set — it is *not* ~/.claude/.claude.json.
+        self.live_config_path = os.path.expanduser(
+            os.path.join(live_dir, CONFIG_FILE) if explicit_dir
+            else os.path.join(os.path.expanduser("~"), CONFIG_FILE))
+        # opt-in: also point the display identity at the account we swap to.
+        self.sync_identity = bool(getattr(args, "sync_identity", False))
         self.state_path = os.path.join(self.root, ".ccroll", "state.json")
         self.threshold = float(getattr(args, "threshold", 95))
         self.scoped_threshold = float(getattr(args, "scoped_threshold", 97))
@@ -607,6 +616,50 @@ def eta_to_limit(pct: float | None, rate: float | None) -> float | None:
 
 
 # --- swap engine ----------------------------------------------------------------
+def _mtime_ns(path: str) -> int | None:
+    try:
+        return os.stat(path).st_mtime_ns
+    except OSError:
+        return None
+
+
+def swap_identity(cfg: Cfg, target: Account) -> str | None:
+    """Point Claude Code's *display* identity at the account we swapped to.
+
+    `/status` reads the email and organization from the `oauthAccount` object
+    in the global config, not from the credentials file, so after a swap it
+    keeps naming the previous account.  Auth is unaffected — that follows the
+    token — but the same object also feeds the organization header used by
+    cloud sessions and remote control, plus telemetry and org-scoped gating.
+
+    Only that one key is ever copied.  The live config also holds every
+    project's session history, so the file itself is never replaced with the
+    store's copy, and a read that looks truncated or that another session
+    rewrote underneath us is skipped rather than written.
+
+    Returns a line for the event log, or None when there was nothing to do."""
+    ident = (read_json(os.path.join(cfg.root, target.name, CONFIG_FILE)) or {}).get("oauthAccount")
+    if not isinstance(ident, dict) or not ident:
+        return f"identity left as-is: no stored oauthAccount for {target.name}"
+    path = cfg.live_config_path
+    for _ in range(2):
+        before = _mtime_ns(path)
+        live = read_json(path)
+        if not isinstance(live, dict) or len(live) < MIN_CONFIG_KEYS:
+            return f"identity left as-is: {path} is missing, unreadable or truncated"
+        if live.get("oauthAccount") == ident:
+            return None
+        patched = dict(live)
+        patched["oauthAccount"] = ident
+        if not set(patched) >= set(live):     # never lose a top-level key
+            return "identity left as-is: live config changed shape mid-patch"
+        if _mtime_ns(path) != before:
+            continue                          # a session wrote in between: re-read
+        write_json_atomic(path, patched)
+        return f"identity synced to {target.name}"
+    return "identity left as-is: live config is being written by another session"
+
+
 def harvest(cfg: Cfg, state: dict) -> None:
     """Copy the live credentials back into the active account's store dir.
     Refresh tokens rotate, so the store must always hold the newest one."""
@@ -648,6 +701,10 @@ def do_swap(cfg: Cfg, state: dict, target: Account, reason: str,
                               if snapshot and not snapshot.error else None)
     detail = f"left {prev}: {reason}" if prev and prev != target.name else reason
     add_event(state, f"→ {target.name} ({detail})")
+    if cfg.sync_identity:
+        note = swap_identity(cfg, target)
+        if note:
+            add_event(state, note)
     save_state(cfg, state)
 
     # Guard against the one narrow race: the running CLI finishing a token
@@ -660,6 +717,8 @@ def do_swap(cfg: Cfg, state: dict, target: Account, reason: str,
     ):
         write_json_atomic(cfg.live_path, creds)
         add_event(state, "re-asserted swap over a concurrent write")
+        if cfg.sync_identity:
+            swap_identity(cfg, target)        # re-assert the identity too, quietly
         save_state(cfg, state)
     return detail
 
@@ -1696,6 +1755,10 @@ def cmd_switch(cfg: Cfg, a: Ansi, name: str) -> int:
     target = get_account(cfg, name)
     do_swap(cfg, state, target, "manual")
     print(a.green(f"✓ live credentials now {target.name} — running sessions pick this up automatically"))
+    if cfg.sync_identity:
+        for t, msg in state.get("events", [])[-2:]:
+            if msg.startswith("identity "):
+                print(a.dim(f"  {msg}"))
     return 0
 
 
@@ -1762,6 +1825,7 @@ def main(argv: list[str] | None = None) -> int:
     w.add_argument("--preempt-max-cost", type=float, default=5.0, metavar="PERCENT",
                    help="skip pre-emption when the measured swap cost (preload) on the governing "
                         "weekly window exceeds this (default 5)")
+    w.add_argument("--sync-identity", action="store_true", help="also point Claude Code's displayed identity (the `oauthAccount` block in its global config) at the account swapped to, so /status stops naming the previous one; auth already follows the swap without this. Off by default: running sessions cache that config in memory, so the correction usually shows up only in newly started sessions, and a session that rewrites the file from memory undoes it")
 
     sub.add_parser("status", help="one-shot usage table for all accounts")
     sub.add_parser("add", help="log account(s) in interactively; each is named by its own email",
@@ -1769,6 +1833,7 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("adopt", help="save the current live login into the store under its email")
     sp = sub.add_parser("switch", help="hot-swap the live credentials now")
     sp.add_argument("name", help="account email (a unique prefix is enough)")
+    sp.add_argument("--sync-identity", action="store_true", help="also point Claude Code's displayed identity (the `oauthAccount` block in its global config) at the account swapped to, so /status stops naming the previous one; auth already follows the swap without this. Off by default: running sessions cache that config in memory, so the correction usually shows up only in newly started sessions, and a session that rewrites the file from memory undoes it")
     sub.add_parser("list", help="accounts and token expiries")
 
     args = p.parse_args(argv)
