@@ -87,6 +87,9 @@ BURN_MIN_SAMPLES = 3
 BURN_MIN_SPAN_S = 90            # 3 polls at the 60s default: a figure after ~2 min
 BURN_SETTLED_SPAN_S = 8 * 60    # shorter fits are shown dimmed as provisional
 BURN_MIN_RATE = 0.05            # %/h below this shows as idle
+EARLY_MIN_PCT = 50              # burn-based early rotation only from here up: below it an
+                                # ETA under the lead would need >1000%/h, which is noise
+                                # (the post-swap re-prime spike), not a sustained rate
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@+-]{0,127}$")  # account emails
 LIVE_PSEUDO = "(live login)"  # display row for a live login not in the store
 
@@ -516,6 +519,14 @@ def append_sample(state: dict, name: str, window: str, pct: float | None) -> Non
         series.pop(0)
 
 
+def reset_samples(state: dict, name: str) -> None:
+    """Start the burn series of `name` afresh.  Called at every swap: samples
+    taken while the account was idle in the fleet scan say nothing about how
+    fast it will burn now, and the first post-swap poll shows a one-time
+    jump (every running agent re-primes its context) that is not a rate."""
+    state.setdefault("samples", {}).pop(name, None)
+
+
 def burn_fit(series: list) -> tuple[float, float] | None:
     """Least-squares slope in %/hour over the recent sample window, plus the
     span in seconds the fit covers (short spans are provisional)."""
@@ -571,6 +582,7 @@ def do_swap(cfg: Cfg, state: dict, target: Account, reason: str) -> str:
     write_json_atomic(cfg.live_path, creds)
     state["active"] = target.name
     state["last_swap"] = now()
+    reset_samples(state, target.name)
     detail = f"left {prev}: {reason}" if prev and prev != target.name else reason
     add_event(state, f"→ {target.name} ({detail})")
     save_state(cfg, state)
@@ -607,18 +619,24 @@ def is_exhausted(u: Usage | None, cfg: Cfg) -> str | None:
 
 def active_burn(state: dict, name: str, key: str) -> float | None:
     """Conservative burn estimate for one window of the active account, %/h:
-    the larger of the least-squares slope and the slope of the last two
-    samples, so a burst that just started is caught even though the 45-minute
-    fit lags.  None until there is a fit at all."""
+    the larger of the least-squares slope and the *sustained* recent slope,
+    so a burst that just started is caught even though the 45-minute fit
+    lags.  "Sustained" means the smaller of the last two step slopes: a
+    single jump between two polls (the re-prime after a swap) does not count
+    until the next poll confirms it.  None until there is a fit at all;
+    the series restarts at every swap, so a fit exists after ~2 minutes."""
     series = state.get("samples", {}).get(name, {}).get(key, [])
     fit = burn_fit(series)
     if fit is None:
         return None
     rate = fit[0]
-    if len(series) >= 2:
-        (t0, p0), (t1, p1) = series[-2], series[-1]
-        if t1 > t0:
-            rate = max(rate, (p1 - p0) / (t1 - t0) * 3600)
+    if len(series) >= 3:
+        steps = []
+        for (t0, p0), (t1, p1) in (series[-3:-1], series[-2:]):
+            if t1 > t0:
+                steps.append((p1 - p0) / (t1 - t0) * 3600)
+        if len(steps) == 2:
+            rate = max(rate, min(steps))
     return rate
 
 
@@ -636,7 +654,7 @@ def about_to_exhaust(state: dict, name: str, u: Usage | None, cfg: Cfg) -> str |
     if cfg.mode == "scoped":
         windows.append(("scoped", (u.scoped_label or "scoped").lower() + " weekly", u.scoped_pct))
     for key, label, pct in windows:
-        if pct is None:
+        if pct is None or pct < EARLY_MIN_PCT:
             continue
         rate = active_burn(state, name, key)
         eta = eta_to_limit(pct, rate)
