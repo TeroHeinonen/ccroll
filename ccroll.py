@@ -90,8 +90,6 @@ USAGE_BACKOFF_CAP_S = 300       # the back-off never exceeds a fleet scan interv
 FRESH_PERISH_RATE = 97 / 168    # %/h an unopened weekly window "loses" by not starting
                                 # its 7-day clock: one full window per week
 TOUCH_REASON = "opens a fresh"  # prefix of the reason a --touch move carries
-FAST_POLL_BELOW_S = 10 * 60     # poll the active account faster once a limit is this close
-FAST_POLL_S = 15
 REFRESH_MARGIN_S = 180          # refresh an access token this close to expiry
 SWAP_VERIFY_DELAY_S = 2.0       # re-check the live file this long after a swap
 SAMPLE_RETENTION_S = 24 * 3600  # keep at most a day of burn-rate samples
@@ -100,6 +98,8 @@ BURN_MIN_SAMPLES = 3
 BURN_MIN_SPAN_S = 90            # 3 polls at the 60s default: a figure after ~2 min
 BURN_SETTLED_SPAN_S = 8 * 60    # shorter fits are shown dimmed as provisional
 BURN_MIN_RATE = 0.05            # %/h below this shows as idle
+USAGE_PCT_STEP = 1.0            # the usage endpoint reports whole percents: a swap cost
+                                # measured as 0 is below this step, not zero
 SESSION_WINDOW_H = 5.0          # the 5-hour session window, for the fleet forecast
 WEEK_H = 168.0
 PRELOAD_KEEP = 5                # preload measurements kept for the median
@@ -441,7 +441,6 @@ class Usage:
         self.scoped_label = None
         self.status = None
         self.error = None
-        self.throttled = False      # this read itself got a 429 (not the synthetic cooldown)
         self.projected_from = None  # {session, weekly, scoped}: the raw reading, when projected
         self.projected_rate = None  # {key: %/h} the projection advanced each window by
         self.projected_age = None   # seconds between that reading and the projection
@@ -532,7 +531,6 @@ def usage_for(cred_path: str, backoff_cap: float = USAGE_BACKOFF_CAP_S) -> Usage
         except CcrollError as e:
             u = Usage(); u.error = str(e)
     if _rate_limited(u.error):
-        u.throttled = True
         delay = min(backoff_cap, delay * 2) if delay else USAGE_ERROR_COOLDOWN_S
         _usage_cooldown[cred_path] = (now() + delay, delay)
     else:
@@ -1464,16 +1462,6 @@ def predicted_switch_eta(state: dict, name: str, u: Usage, cfg: Cfg):
     return best
 
 
-def nearest_limit(state: dict, name: str, u: Usage, cfg: Cfg):
-    """The window closest to its limit at the current burn: (label, pct,
-    rate, eta), or None when no window has an estimate and a finite ETA."""
-    best = None
-    for _, label, pct, rate, eta in limit_etas(state, name, u, cfg):
-        if eta is not None and (best is None or eta < best[3]):
-            best = (label, pct, rate, eta)
-    return best
-
-
 def _fmt_eta_short(secs: float) -> str:
     return "<1m" if secs < 60 else f"{secs / 60:.0f}m"
 
@@ -1611,25 +1599,39 @@ def preempt_target(cfg: Cfg, state: dict, usages: dict, active: str,
 
     In a Fable-bound fleet the account to sit on is the one whose governing
     window resets next: its unused headroom is the first to vanish, and being
-    on it when it resets reopens its next week with no idle gap.  Reset times
-    never move once a window is open, so this target is stable — no flapping.
-    With --touch, an account whose window is not open at all is taken first,
-    for one request, so its next week starts now rather than hours later.
+    on it when it resets reopens its next week with no idle gap.  With
+    --touch, an account whose window is not open at all is taken first, for
+    one request, so its next week starts now rather than hours later.
 
     Gates: a burn estimate must exist and give the active account more than
     --preempt-runway of headroom (when sessions bind, runway is short and a
     pre-emptive swap would only add a cache re-prime); the active window must
     be open (a touch or reset is still taking effect); the post-swap grace
-    must be over; and the measured preload on the governing window must not
-    exceed --preempt-max-cost.
+    must be over; the measured preload on the governing window must not
+    exceed --preempt-max-cost; and the move must be worth its cost.
 
-    There is no minimum interval between moves, and none is needed: a move
-    goes only to an account whose reset is strictly earlier than ours, and a
-    reset never changes while its window is open, so the account we left can
-    never be chosen again — targets descend in reset time and run out.  The
-    one path that could chain is --touch, since touching a window opens it
-    and the next fresh account inherits the target; that is held to one touch
-    per natural cycle (state["touch_pending"], cleared by the next
+    Worth: a lead of `lead` hours on the reset can rescue at most burn × lead
+    percent of headroom — the two accounts differ only in the order they are
+    drained, and that order matters only during the interval where one window
+    is still open and the other has already reset.  The swap costs the
+    measured preload on that window.  So the move is made only when
+    burn × lead exceeds the preload by at least the step the endpoint reports
+    percentages in (a preload measured as 0 is below 1%, not free).  Both
+    sides are measured, so the bar scales with the burn: at 5 %/h a lead
+    pays from about twelve minutes, at 0.5 %/h from two hours.
+
+    This is also what keeps the target from flapping.  The endpoint computes
+    each reset relative to the read and rounds it to the minute, so two
+    windows that truly reset within the same minute read as "one minute
+    sooner" in either direction depending on the second they were polled
+    at — the old strict comparison ping-ponged between such a pair every
+    few minutes.  A lead worth a swap is many minutes at any burn the runway
+    gate lets through (it caps the burn at 100 % / --preempt-runway), far
+    beyond the rounding, so the order it acts on is stable; and every move
+    still goes to a strictly earlier reset, so targets descend and run out.
+    The one path that could chain is --touch, since touching a window opens
+    it and the next fresh account inherits the target; that is held to one
+    touch per natural cycle (state["touch_pending"], cleared by the next
     exhaustion-driven swap), which scales with the cycle instead of the clock."""
     t = now() if t is None else t
     u = usages.get(active)
@@ -1660,7 +1662,13 @@ def preempt_target(cfg: Cfg, state: dict, usages: dict, active: str,
     reset, name = min(opened)
     if reset >= a_reset:
         return None
-    return name, f"{label} resets {fmt_dur(a_reset - reset)} sooner, in {fmt_dur(reset - t)}"
+    lead_h = (a_reset - reset) / 3600.0
+    rate = active_burn(state, active, "weekly" if cfg.mode == "weekly" else "scoped")
+    gain = (rate or 0.0) * lead_h          # the most headroom the lead can rescue
+    if gain <= (cost or 0.0) + USAGE_PCT_STEP:
+        return None                      # the lead is not worth a swap at this burn
+    return name, (f"{label} resets {fmt_dur(a_reset - reset)} sooner, in {fmt_dur(reset - t)}; "
+                  f"up to {gain:.1f}% at stake for a {cost or 0:.0f}% swap")
 
 
 def target_reason(u: Usage, cfg: Cfg, label: str) -> str:
@@ -2145,16 +2153,9 @@ def cmd_watch(cfg: Cfg, a: Ansi) -> int:
     paused = not cfg.rotate
     notice = ""
     tty_out = sys.stdout.isatty()
-    # the fastest cadence the usage endpoint has been seen to tolerate this
-    # run: starts at FAST_POLL_S and doubles whenever a poll of the active
-    # account is answered with a 429, up to --interval (fast poll off).  It
-    # never relaxes within a run; a restart probes again.
-    poll_floor = float(FAST_POLL_S)
-    poll_in_force = float(cfg.interval)
-    throttled_at = None               # the cadence the endpoint last refused
 
     def rescan():
-        nonlocal usages, next_scan, next_active_poll, poll_in_force
+        nonlocal usages, next_scan, next_active_poll
         accounts[:] = list_accounts(cfg)
         fresh = scan_accounts(cfg, accounts, state.get("active"))
         if state.get("active") is None and oauth_of(read_json(cfg.live_path)):
@@ -2164,39 +2165,24 @@ def cmd_watch(cfg: Cfg, a: Ansi) -> int:
         record_samples(state, usages)
         save_state(cfg, state)
         next_scan = now() + cfg.scan
-        poll_in_force = poll_interval()
-        next_active_poll = now() + poll_in_force
+        next_active_poll = now() + cfg.interval
 
     def remember_good(fresh: dict) -> None:
         for name, u in fresh.items():
             if u is not None and not u.error and u.session_pct is not None:
                 last_good[name] = u
 
-    def poll_interval() -> float:
-        """Poll the active account faster while a limit is under ten minutes
-        away at the current burn, else at --interval.  "Faster" is FAST_POLL_S
-        or the floor the endpoint's own 429s have raised it to."""
-        name = state.get("active")
-        u = usages.get(name) if name else None
-        if u and not u.error:
-            r = runway_s(state, name, u, cfg)
-            if r is not None and r < FAST_POLL_BELOW_S:
-                return max(poll_floor, float(FAST_POLL_S))
-        return float(cfg.interval)
-
     def poll_active():
-        nonlocal next_active_poll, poll_floor, poll_in_force, throttled_at
+        """The active account is polled at --interval, never faster: the
+        usage endpoint throttles any tighter cadence within minutes, and a
+        throttled read is worth less than a late one.  What a limit needs
+        when it is close is projection (rate × age) and the lead, not more
+        reads."""
+        nonlocal next_active_poll
         name = state.get("active")
         key = name or LIVE_PSEUDO
         if oauth_of(read_json(cfg.live_path)):
             usages[key] = usage_for(cfg.live_path, backoff_cap=cfg.scan)
-            if usages[key].throttled and poll_in_force < cfg.interval:
-                # the endpoint refused the fast cadence: back off to double it
-                # and stay there for the rest of the run.  A 429 answered at
-                # the base interval (every retry inside a blackout is one)
-                # says nothing about the fast cadence, so it leaves the floor.
-                throttled_at = poll_in_force
-                poll_floor = min(float(cfg.interval), max(poll_floor, 2 * poll_in_force))
             remember_good({key: usages[key]})
             if name:
                 record_samples(state, {name: usages[key]})
@@ -2205,8 +2191,7 @@ def cmd_watch(cfg: Cfg, a: Ansi) -> int:
                 maybe_signal_reset(cfg, state, name, usages[key])
                 maybe_signal_expected(cfg, state, name, usages[key], not paused)
                 save_state(cfg, state)
-        poll_in_force = poll_interval()
-        next_active_poll = now() + poll_in_force
+        next_active_poll = now() + cfg.interval
 
     def maybe_rotate():
         nonlocal notice, next_scan
@@ -2304,10 +2289,6 @@ def cmd_watch(cfg: Cfg, a: Ansi) -> int:
                 else a.green(f"auto-rotate at session≥{cfg.threshold:.0f}% / {govern} "
                              f"or ≤{cfg.lead:.0f}s from a limit{early}"))
         head = a.bold(f"ccroll {CCROLL_VERSION}") + a.dim("  ·  ") + mode + a.dim("  ·  ") + fmt_clock(now())
-        if poll_floor > FAST_POLL_S:
-            fast = ("off" if poll_floor >= cfg.interval else f"{poll_floor:.0f} s")
-            head += a.dim("  ·  ") + a.yellow(
-                f"fast poll {fast} (endpoint throttled at {throttled_at:.0f} s)")
         lines = [head, ""]
         view = merged_view(usages, last_good, state)
         lines += render_table(a, build_rows(cfg, state, accounts, view), label)
@@ -2318,11 +2299,6 @@ def cmd_watch(cfg: Cfg, a: Ansi) -> int:
             soon = about_to_exhaust(state, active, view[active], cfg)
             if soon:
                 lines.append(a.red(f"  ⚠ rotating early: {soon}"))
-            elif poll_interval() != cfg.interval:
-                near = nearest_limit(state, active, view[active], cfg)
-                what = (f"{near[0]} limit in ≈{fmt_dur(near[3])} at {near[2]:.0f}%/h"
-                        if near else f"limit under {FAST_POLL_BELOW_S // 60} min away")
-                lines.append(a.yellow(f"  ⚠ {what} — polling every {poll_interval():.0f} s"))
             lines += [""] + render_fleet(a, state, active, view[active], cfg,
                                          readable_accounts(accounts, usages), label, usages=usages)
         target = pick_target(usages, cfg, exclude=active, preload=preload_estimate(state))
