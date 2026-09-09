@@ -1273,23 +1273,27 @@ def pct_text(u: Usage, key: str, pct: float | None) -> str:
             f" + {rate:.0f}%/h)")
 
 
-def is_exhausted(u: Usage | None, cfg: Cfg) -> str | None:
+def is_exhausted(u: Usage | None, cfg: Cfg, t: float | None = None) -> str | None:
     """Return the reason the account counts as spent, or None.
 
     A failed read yields None — missing data never rotates.  The watch loop
     handles the one case where that is not enough (the *active* account
     going unreadable) by falling back to its last good snapshot, projected
-    forward by its age (`projected_usage`)."""
+    forward by its age (`projected_usage`).
+
+    `t` is the moment to judge at (default now): a window whose reset has
+    passed by then no longer counts, so the same reading can be asked what
+    it will look like once the fleet has recovered."""
     if u is None or u.error:
         return None  # never rotate on missing data
     if (u.status or "").lower() in ("rejected", "exceeded", "blocked"):
         return f"status {u.status}"
-    if window_spent(u.session_pct, u.session_reset, cfg.threshold):
+    if window_spent(u.session_pct, u.session_reset, cfg.threshold, t):
         return "session " + pct_text(u, "session", u.session_pct)
-    if cfg.mode == "scoped" and window_spent(u.scoped_pct, u.scoped_reset, cfg.scoped_threshold):
+    if cfg.mode == "scoped" and window_spent(u.scoped_pct, u.scoped_reset, cfg.scoped_threshold, t):
         return (f"{(u.scoped_label or 'scoped').lower()} weekly "
                 + pct_text(u, "scoped", u.scoped_pct))
-    if window_spent(u.weekly_pct, u.weekly_reset, 99.5):
+    if window_spent(u.weekly_pct, u.weekly_reset, 99.5, t):
         return "weekly " + pct_text(u, "weekly", u.weekly_pct)
     return None
 
@@ -1545,7 +1549,7 @@ def candidates(usages: dict, cfg: Cfg, exclude: str | None,
     ok = [(n, u) for n, u in usages.items()
           if n != exclude and n != LIVE_PSEUDO
           and u and not u.error and u.session_pct is not None
-          and not is_exhausted(u, cfg)]
+          and not is_exhausted(u, cfg, t)]
     strict = [(n, u) for n, u in ok if comfortable(u, cfg, preload, t)]
     return strict, ok
 
@@ -1705,31 +1709,57 @@ def verified_target(cfg: Cfg, usages: dict, active: str | None,
     return None
 
 
-def earliest_recovery(usages: dict, cfg: Cfg) -> tuple[float, str] | None:
-    """When every account is spent: the first moment any of them frees up.
-    An account recovers when ALL of its binding limits have reset (max of its
-    resets); the fleet recovers at the min of that across accounts.
+def recovery_moment(u: Usage, cfg: Cfg, t: float) -> float | None:
+    """When this spent account frees up: the moment ALL of its binding limits
+    have reset (max of its resets).  Only resets still in the future count.
+    A reset already in the past has happened, so the moment it names is not
+    a moment to wait for — returning it would schedule a rescan in the past
+    and spin the watch loop."""
+    resets = []
+    if window_spent(u.session_pct, u.session_reset, cfg.threshold, t) and u.session_reset:
+        resets.append(u.session_reset)
+    if cfg.mode == "scoped" and window_spent(u.scoped_pct, u.scoped_reset,
+                                             cfg.scoped_threshold, t) and u.scoped_reset:
+        resets.append(u.scoped_reset)
+    if window_spent(u.weekly_pct, u.weekly_reset, 99.5, t) and u.weekly_reset:
+        resets.append(u.weekly_reset)
+    resets = [r for r in resets if r > t]
+    return max(resets) if resets else None
 
-    Only resets still in the future count.  A reset already in the past has
-    happened, so the moment it names is not a moment to wait for — returning
-    it would schedule a rescan in the past and spin the watch loop."""
+
+def earliest_recovery(usages: dict, cfg: Cfg, active: str | None = None,
+                      preload: dict | None = None) -> tuple[float, str] | None:
+    """When every account is spent: the first moment any of them frees up,
+    and the account the fleet will actually be on once it has.
+
+    The fleet recovers at the min of `recovery_moment` across accounts, and
+    the watch loop rescans a settle buffer after that.  The account named
+    here is the one that rescan will land on — judged by the same rules it
+    uses, at the moment it runs — not merely whichever reset ticks first.
+    Several windows often reset within the same minute; when a spent session
+    and a fresh weekly window free up together, `pick_target` takes the
+    fresh weekly one, and the notice must say so or it names an account the
+    swap then never goes to.  If the active account itself is clear by then,
+    the loop stays put, so it is the one waited for."""
     t = now()
-    best = None
+    moments = {}
     for name, u in usages.items():
         if name == LIVE_PSEUDO or u is None or u.error or not is_exhausted(u, cfg):
             continue
-        resets = []
-        if window_spent(u.session_pct, u.session_reset, cfg.threshold, t) and u.session_reset:
-            resets.append(u.session_reset)
-        if cfg.mode == "scoped" and window_spent(u.scoped_pct, u.scoped_reset,
-                                                 cfg.scoped_threshold, t) and u.scoped_reset:
-            resets.append(u.scoped_reset)
-        if window_spent(u.weekly_pct, u.weekly_reset, 99.5, t) and u.weekly_reset:
-            resets.append(u.weekly_reset)
-        resets = [r for r in resets if r > t]
-        if resets and (best is None or max(resets) < best[0]):
-            best = (max(resets), name)
-    return best
+        when = recovery_moment(u, cfg, t)
+        if when is not None:
+            moments[name] = when
+    if not moments:
+        return None
+    first = min(moments.values())
+    at = first + RESCAN_MIN_S
+    if active in moments and moments[active] <= at:
+        who = active
+    else:
+        who = pick_target(usages, cfg, exclude=active, t=at, preload=preload)
+    if who is None or who not in moments:
+        who = min(moments, key=lambda n: (moments[n], n))
+    return moments[who], who
 
 
 def merged_view(usages: dict, last_good: dict, state: dict | None = None) -> dict:
@@ -2120,11 +2150,11 @@ def cmd_status(cfg: Cfg, a: Ansi) -> int:
         print()
         print(a.green(f"→ best fallback: {target} ({target_reason(u, cfg, label)})"))
     elif accounts:
-        recovery = earliest_recovery(usages, cfg)
+        recovery = earliest_recovery(usages, cfg, active, preload_estimate(state))
         if recovery:
             when, who = recovery
             print()
-            print(a.red(f"→ no account has headroom — {who} recovers first, in {fmt_dur(when - now())}"))
+            print(a.red(f"→ no account has headroom — {who} is next, in {fmt_dur(when - now())}"))
     if not accounts:
         print()
         print(a.yellow("No accounts yet — add them with:  ccroll add"))
@@ -2224,12 +2254,12 @@ def cmd_watch(cfg: Cfg, a: Ansi) -> int:
         if not target:
             # everyone is spent: hold position and rescan the moment the first
             # account's binding limits have reset (plus a small settle buffer)
-            recovery = earliest_recovery(usages, cfg)
+            recovery = earliest_recovery(usages, cfg, active, preload_estimate(state))
             if recovery:
                 when, who = recovery
                 notice = (f"all accounts exhausted — waiting for {who} "
                           f"(recovers in {fmt_dur(when - now())})")
-                next_scan = min(next_scan, max(when + 30, now() + RESCAN_MIN_S))
+                next_scan = min(next_scan, max(when + RESCAN_MIN_S, now() + RESCAN_MIN_S))
             else:
                 notice = "active account exhausted but no fallback has headroom"
                 next_scan = min(next_scan, now() + max(RESCAN_MIN_S, cfg.interval))
