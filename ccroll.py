@@ -2448,6 +2448,25 @@ def _email_of_creds(oauth: dict, retries: int = 3) -> str | None:
     return None
 
 
+def login_email(oauth: dict, profile_dir: str) -> tuple[str | None, str | None]:
+    """(email, note) for a login just completed in `profile_dir`.
+
+    The account's own profile endpoint is asked first.  When it does not
+    answer — it shares the per-account limiter with the usage endpoint, so a
+    busy night is exactly when it will not — the identity the CLI wrote into
+    the profile at login is the same account's own word for who it is, and
+    stands in.  A completed login is never discarded for a transient read;
+    the note says which source named the account."""
+    email = _email_of_creds(oauth)
+    if email:
+        return email, None
+    ident = (read_json(os.path.join(profile_dir, CONFIG_FILE)) or {}).get("oauthAccount") or {}
+    email = ident.get("emailAddress") if isinstance(ident, dict) else None
+    if isinstance(email, str) and "@" in email:
+        return email, "profile endpoint did not answer; named from the login's stored identity"
+    return None, None
+
+
 def _register(cfg: Cfg, state: dict, email: str, creds: dict) -> None:
     """File credentials under the account's email (the enforced identity)."""
     if not NAME_RE.match(email):
@@ -2478,14 +2497,20 @@ def cmd_add(cfg: Cfg, a: Ansi) -> int:
         oauth = oauth_of(creds)
         if not oauth:
             shutil.rmtree(tmp, ignore_errors=True)
+            add_event(state, "add: login discarded — no credentials stored")
+            save_state(cfg, state)
             print(a.red("✗ no credentials were stored — login not completed?"))
         else:
             if "user:profile" not in (oauth.get("scopes") or []):
                 print(a.yellow("⚠ token lacks user:profile scope (console login?) — "
                                "usage cannot be read; use the Claude-account login instead"))
-            email = _email_of_creds(oauth)
+            email, note = login_email(oauth, tmp)
+            if note:
+                print(a.yellow(f"⚠ {note}"))
             if not email:
                 shutil.rmtree(tmp, ignore_errors=True)
+                add_event(state, "add: login discarded — account email unreadable")
+                save_state(cfg, state)
                 print(a.red("✗ could not read the account's email (network?) — nothing saved, try again"))
             else:
                 dest = os.path.join(cfg.root, email)
