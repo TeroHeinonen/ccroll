@@ -84,9 +84,7 @@ ROLLED_MARK = "rolled"          # reset column for a window whose reset has pass
 RESCAN_MIN_S = 30               # floor on any scheduled rescan, so a stale reset time
                                 # can never turn the watch loop into a scan storm
 LAST_GOOD_MAX_AGE_S = 15 * 60   # how long a cached usage read stands in for a failed one
-USAGE_ERROR_COOLDOWN_S = 60     # first back-off on an account the endpoint throttles;
-                                # doubles on every further 429 in a row, resets on a good read
-USAGE_BACKOFF_CAP_S = 300       # the back-off never exceeds a fleet scan interval
+USAGE_ERROR_MSG_CHARS = 26      # how much of a 429's own message the status column carries
 FRESH_PERISH_RATE = 97 / 168    # %/h an unopened weekly window "loses" by not starting
                                 # its 7-day clock: one full window per week
 TOUCH_REASON = "opens a fresh"  # prefix of the reason a --touch move carries
@@ -225,7 +223,7 @@ def sev_color(a: Ansi, pct: float | None):
 
 # --- HTTP -----------------------------------------------------------------------
 def _http(method: str, url: str, token: str | None, body: dict | None):
-    """Return (status:int|None, body_bytes:bytes, neterr:str|None)."""
+    """Return (status:int|None, body_bytes:bytes, neterr:str|None, headers)."""
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(url, data=data, method=method)
     req.add_header("User-Agent", USER_AGENT)
@@ -236,11 +234,28 @@ def _http(method: str, url: str, token: str | None, body: dict | None):
     req.add_header("Content-Type", "application/json")
     try:
         with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_S) as resp:
-            return resp.status, resp.read(), None
+            return resp.status, resp.read(), None, resp.headers
     except urllib.error.HTTPError as e:
-        return e.code, e.read(), None
+        return e.code, e.read(), None, e.headers
     except Exception as e:
-        return None, b"", str(getattr(e, "reason", e))
+        return None, b"", str(getattr(e, "reason", e)), None
+
+
+def retry_after_s(headers) -> float | None:
+    """Seconds the server asked us to wait, from a Retry-After header given
+    either as a delay or as an HTTP date.  None when there is no such ask."""
+    raw = headers.get("Retry-After") if headers is not None else None
+    if not raw:
+        return None
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        pass
+    try:
+        from email.utils import parsedate_to_datetime
+        return max(0.0, parsedate_to_datetime(raw).timestamp() - now())
+    except (TypeError, ValueError):
+        return None
 
 
 def http_detail(status: int | None, raw: bytes, j: dict | None = None) -> str:
@@ -375,7 +390,7 @@ def oauth_refresh(oauth: dict) -> dict:
     body = {"grant_type": "refresh_token", "refresh_token": refresh, "client_id": CLIENT_ID}
     delay = REFRESH_BACKOFF_S
     for attempt in range(REFRESH_RETRIES):
-        status, data, neterr = _http("POST", TOKEN_URL, None, body)
+        status, data, neterr, _ = _http("POST", TOKEN_URL, None, body)
         if neterr:
             raise CcrollError(f"token refresh network error: {neterr}")
         try:
@@ -441,6 +456,7 @@ class Usage:
         self.scoped_label = None
         self.status = None
         self.error = None
+        self.retry_after = None     # seconds a 429 asked us to wait, when it said
         self.projected_from = None  # {session, weekly, scoped}: the raw reading, when projected
         self.projected_rate = None  # {key: %/h} the projection advanced each window by
         self.projected_age = None   # seconds between that reading and the projection
@@ -452,7 +468,7 @@ class Usage:
 
 def fetch_usage(token: str) -> Usage:
     u = Usage()
-    status, data, neterr = _http("GET", API_BASE + USAGE_PATH, token, None)
+    status, data, neterr, headers = _http("GET", API_BASE + USAGE_PATH, token, None)
     if neterr:
         u.error = f"network: {neterr}"
         return u
@@ -461,11 +477,18 @@ def fetch_usage(token: str) -> Usage:
     except json.JSONDecodeError:
         j = {}
     if not isinstance(j, dict) or j.get("type") == "error" or isinstance(j.get("error"), dict):
-        etype = (j.get("error") or {}).get("type") if isinstance(j.get("error"), dict) else None
+        err = j.get("error") if isinstance(j.get("error"), dict) else {}
+        etype = err.get("type")
         if status == 401 or etype == "authentication_error":
             u.error = "auth"
         elif etype == "permission_error":
             u.error = "token lacks user:profile scope — re-login interactively"
+        elif status == 429 or etype == "rate_limit_error":
+            # Keep what the server said: which limiter answered is the one
+            # thing that tells a throttle we caused from one we are caught in.
+            msg = " ".join(str(err.get("message") or "").split())
+            u.error = "rate_limit_error" + (f" · {msg[:USAGE_ERROR_MSG_CHARS]}" if msg else "")
+            u.retry_after = retry_after_s(headers)
         else:
             u.error = etype or f"http {status}"
         return u
@@ -493,28 +516,34 @@ def fetch_usage(token: str) -> Usage:
     return u
 
 
-_usage_cooldown: dict[str, tuple[float, float]] = {}   # cred_path -> (until, delay)
+_usage_hold: dict[str, float] = {}   # cred_path -> when a Retry-After lets us ask again
 
 
 def _rate_limited(err: str | None) -> bool:
     return bool(err) and ("rate_limit" in err or "429" in err)
 
 
-def usage_for(cred_path: str, backoff_cap: float = USAGE_BACKOFF_CAP_S) -> Usage:
+def usage_for(cred_path: str) -> Usage:
     """Fetch usage for stored credentials, refreshing the token when needed
     (including one retry when a supposedly-valid token turns out revoked).
 
-    An account the endpoint has just throttled is left alone for a while:
-    retrying it every poll only deepens the throttle, and the caller keeps
-    showing its last good numbers meanwhile.  The back-off starts at
-    USAGE_ERROR_COOLDOWN_S and doubles on every consecutive 429 up to
-    `backoff_cap`, so a throttle that is still in force gets fewer and fewer
-    retries to feed on, and resets on the first clean read.  A fixed 60 s
-    retry kept one throttle alive for eleven minutes."""
-    until, delay = _usage_cooldown.get(cred_path, (0.0, 0.0))
-    if until and now() < until:
+    A 429 from the usage endpoint is not a penalty this poll earned.  The
+    endpoint's per-account limiter is shared with the running CLI, which
+    fetches usage itself whenever its requests are being held at a limit —
+    exactly the minutes an account is spent or burning hard.  The samples
+    show it: mrsmith@ answered every other read with a 429 for the two hours
+    it sat at 100%, and aws@ read cleanly once a minute for twenty minutes
+    and then failed the moment its agents were being held, with nothing
+    changed on this side.  Backing off only blinds ccroll for the minutes it
+    most needs to see, and the doubling retry it replaced kept the same
+    accounts just as dark.  So a throttled account is asked again at the
+    normal cadence — never faster, and that cadence is what the endpoint
+    accepts at idle — unless the 429 carried a Retry-After, which is
+    honoured to the second."""
+    until = _usage_hold.get(cred_path, 0.0)
+    if now() < until:
         u = Usage()
-        u.error = f"rate_limit_error (retrying in {until - now():.0f}s)"
+        u.error = f"rate_limit_error · server asked to wait {until - now():.0f}s"
         return u
     try:
         token = fresh_token(cred_path)
@@ -530,11 +559,10 @@ def usage_for(cred_path: str, backoff_cap: float = USAGE_BACKOFF_CAP_S) -> Usage
             u = fetch_usage(new["accessToken"])
         except CcrollError as e:
             u = Usage(); u.error = str(e)
-    if _rate_limited(u.error):
-        delay = min(backoff_cap, delay * 2) if delay else USAGE_ERROR_COOLDOWN_S
-        _usage_cooldown[cred_path] = (now() + delay, delay)
+    if u.retry_after:
+        _usage_hold[cred_path] = now() + u.retry_after
     else:
-        _usage_cooldown.pop(cred_path, None)
+        _usage_hold.pop(cred_path, None)
     return u
 
 
@@ -556,7 +584,7 @@ def _find_email(obj):
 
 
 def fetch_email(token: str) -> str | None:
-    status, data, neterr = _http("GET", API_BASE + PROFILE_PATH, token, None)
+    status, data, neterr, _ = _http("GET", API_BASE + PROFILE_PATH, token, None)
     if neterr or status != 200:
         return None
     try:
@@ -2203,16 +2231,15 @@ def cmd_watch(cfg: Cfg, a: Ansi) -> int:
                 last_good[name] = u
 
     def poll_active():
-        """The active account is polled at --interval, never faster: the
-        usage endpoint throttles any tighter cadence within minutes, and a
-        throttled read is worth less than a late one.  What a limit needs
-        when it is close is projection (rate × age) and the lead, not more
-        reads."""
+        """The active account is polled at --interval, never faster, and a
+        429 does not slow it down either (see `usage_for`).  What a limit
+        needs when it is close is projection (rate × age) and the lead, not
+        more reads — and not fewer."""
         nonlocal next_active_poll
         name = state.get("active")
         key = name or LIVE_PSEUDO
         if oauth_of(read_json(cfg.live_path)):
-            usages[key] = usage_for(cfg.live_path, backoff_cap=cfg.scan)
+            usages[key] = usage_for(cfg.live_path)
             remember_good({key: usages[key]})
             if name:
                 record_samples(state, {name: usages[key]})
