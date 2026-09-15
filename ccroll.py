@@ -18,7 +18,10 @@ live dashboard in its own terminal:
 it polls every account's usage through the free OAuth usage endpoint,
 highlights the active account, estimates burn rates and time-to-limit from a
 rolling time series, and hot-swaps to the account whose weekly headroom would
-otherwise expire soonest when the active one approaches a limit.
+otherwise expire soonest when the active one approaches a limit.  A daily
+peak-hour range (default 05:00-11:00 America/Los_Angeles) is sat out by
+parking on an account that is already refusing requests, so every session
+waits out a usage limit as it would anyway, and rotating on at the end.
 
 Stdlib only.  Linux (and any platform where Claude Code keeps credentials in
 a plain file rather than a keychain).
@@ -51,7 +54,8 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime, timezone
+import zoneinfo
+from datetime import datetime, timedelta, timezone
 
 CCROLL_VERSION = "0.1.0"
 
@@ -105,6 +109,10 @@ PRELOAD_MEASURE_MAX_S = 300     # after the grace: measure raw if no fit appears
 EARLY_MIN_PCT = 50              # burn-based early rotation only from here up: below it an
                                 # ETA under the lead would need >1000%/h, which is noise
                                 # (the post-swap re-prime spike), not a sustained rate
+FULL_PCT = 99.5                 # a window the endpoint reports as 100%: the account is
+                                # actually being refused there, not merely past a threshold
+PEAK_HOLD_DEFAULT = "05:00-11:00"   # local clock range (in PEAK_TZ_DEFAULT) to sit out
+PEAK_TZ_DEFAULT = "America/Los_Angeles"
 SIGNAL_DIRNAME = "account-switch"   # under the live Claude config dir
 SIGNAL_EVENTS_FILE = "events.jsonl"
 SIGNAL_STATE_FILE = "state.json"
@@ -189,6 +197,47 @@ def fmt_dur3(a: "Ansi", seconds: float | None) -> tuple[str, int]:
 
 def fmt_clock(t: float) -> str:
     return datetime.fromtimestamp(t).strftime("%H:%M:%S")
+
+
+def parse_clock_range(text: str) -> tuple[int, int]:
+    """'05:00-11:00' -> minutes after local midnight for start and end.  An
+    end at or before the start means the range crosses midnight."""
+    m = re.fullmatch(r"\s*(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})\s*", text or "")
+    if not m:
+        raise CcrollError(f"--peak-hold wants HH:MM-HH:MM, got {text!r}")
+    h1, m1, h2, m2 = (int(x) for x in m.groups())
+    if not (h1 < 24 and h2 < 24 and m1 < 60 and m2 < 60):
+        raise CcrollError(f"--peak-hold has an impossible clock time: {text!r}")
+    start, end = h1 * 60 + m1, h2 * 60 + m2
+    if start == end:
+        raise CcrollError("--peak-hold cannot be empty")
+    return start, end
+
+
+def peak_window(cfg: "Cfg", t: float | None = None) -> tuple[float, float] | None:
+    """The peak-hour range in force at `t`, or the next one to come: (start,
+    end) as epoch seconds.  Computed on the wall clock of --peak-tz, so it
+    lands on the same local time either side of a DST change."""
+    if not cfg.peak:
+        return None
+    t = now() if t is None else t
+    start_m, end_m = cfg.peak
+    if end_m <= start_m:
+        end_m += 24 * 60                  # crosses midnight
+    midnight = datetime.fromtimestamp(t, cfg.peak_tz).replace(hour=0, minute=0,
+                                                              second=0, microsecond=0)
+    for days in (-1, 0, 1):
+        base = midnight + timedelta(days=days)    # wall-clock arithmetic: tz re-resolved
+        start = (base + timedelta(minutes=start_m)).timestamp()
+        end = (base + timedelta(minutes=end_m)).timestamp()
+        if end > t:
+            return start, end
+    return None                           # unreachable: the +1 day window always lies ahead
+
+
+def fmt_local(cfg: "Cfg", t: float) -> str:
+    """'11:00 PDT' — a moment on the wall clock the hold is defined on."""
+    return datetime.fromtimestamp(t, cfg.peak_tz).strftime("%H:%M %Z")
 
 
 # --- ANSI -----------------------------------------------------------------------
@@ -336,6 +385,19 @@ class Cfg:
         self.signal_dir = os.path.expanduser(
             getattr(args, "signal_dir", None) or os.path.join(self.live_dir, SIGNAL_DIRNAME))
         self.settings_path = os.path.join(self.live_dir, SETTINGS_FILE)
+        # peak-hour hold: a daily clock range during which the fleet sits on
+        # an account that is already refusing requests, so the running
+        # sessions wait out "a usage limit" exactly as they do for any other
+        # spent account, and resume by an ordinary rotation at its end.
+        self.peak = None
+        self.peak_tz = None
+        if not getattr(args, "no_peak_hold", False):
+            self.peak = parse_clock_range(getattr(args, "peak_hold", None) or PEAK_HOLD_DEFAULT)
+            tz = getattr(args, "peak_tz", None) or PEAK_TZ_DEFAULT
+            try:
+                self.peak_tz = zoneinfo.ZoneInfo(tz)
+            except (zoneinfo.ZoneInfoNotFoundError, ValueError) as e:
+                raise CcrollError(f"unknown time zone {tz!r} for --peak-tz: {e}")
         # which weekly limit governs exhaustion + next-account choice:
         # "scoped" = the per-model weekly limit (Fable on current Max plans),
         # "weekly" = the all-models weekly limit.
@@ -606,6 +668,8 @@ def load_state(cfg: Cfg) -> dict:
     state.setdefault("preload", [])
     state.setdefault("signal_labels", {})
     state.setdefault("signal_crossed", [])
+    state.setdefault("peak_hold", None)       # start of the peak range being held out
+    state.setdefault("peak_released", None)   # start of the range [r] ended early
     return state
 
 
@@ -1177,25 +1241,46 @@ def signal_after_swap(state: dict) -> None:
     state["signal_crossed"] = []
 
 
+def rotation_utilisation(u: "Usage | None", cfg: Cfg) -> float | None:
+    """The highest effective utilisation across the windows that can trigger
+    rotation — the one figure the protocol's `usage_pct` carries."""
+    if u is None or u.error:
+        return None
+    pcts = [(u.session_pct, u.session_reset), (u.weekly_pct, u.weekly_reset)]
+    if cfg.mode == "scoped":
+        pcts.append((u.scoped_pct, u.scoped_reset))
+    live = [effective_pct(p, r) for p, r in pcts if p is not None]
+    return max(live) if live else None
+
+
 def maybe_signal_expected(cfg: Cfg, state: dict, name: str, u: "Usage | None",
-                          rotating: bool) -> None:
+                          rotating: bool, scheduled: float | None = None,
+                          holding: bool = False) -> None:
     """Announce the coming switch once its predicted moment is about three
-    minutes out.  Needs a burn estimate, so it stays quiet through the
-    post-swap grace, and stays quiet while rotation is paused."""
-    if not cfg.signal or not rotating or u is None or u.error:
+    minutes out.  The burn prediction needs an estimate, so that part stays
+    quiet through the post-swap grace — and through a peak-hour hold, where
+    the account is meant to be spent and no burn-driven swap will follow;
+    `scheduled` is a moment ccroll already knows it will swap at (the hold
+    starting, re-parking, or ending), which needs no estimate.  Whichever
+    comes first is announced.  Stays quiet while rotation is paused."""
+    if not cfg.signal or not rotating or not name or name == LIVE_PSEUDO:
         return
-    if not name or name == LIVE_PSEUDO or in_grace(state):
+    eta_abs, pct = None, None
+    if u is not None and not u.error and not in_grace(state) and not holding:
+        predicted = predicted_switch_eta(state, name, u, cfg)
+        if predicted is not None and predicted[0] <= SIGNAL_EXPECT_LEAD_S:
+            eta_abs, pct = now() + predicted[0], predicted[1]
+    if scheduled is not None and scheduled - now() <= SIGNAL_EXPECT_LEAD_S and (
+            eta_abs is None or scheduled < eta_abs):
+        eta_abs, pct = scheduled, rotation_utilisation(u, cfg) or 0.0
+    if eta_abs is None:
         return
-    predicted = predicted_switch_eta(state, name, u, cfg)
-    if predicted is None or predicted[0] > SIGNAL_EXPECT_LEAD_S:
-        return
-    eta_abs = now() + predicted[0]
     last = state.get("signal_expect_eta")
     if last is not None and abs(eta_abs - last) <= SIGNAL_ETA_DRIFT_S:
         return                            # same prediction, already announced
     state["signal_expect_eta"] = eta_abs
     with signal_guard(state, "switch_expected"):
-        signal_switch_expected(cfg, state, eta_abs, int(round(predicted[1])))
+        signal_switch_expected(cfg, state, eta_abs, int(round(pct)))
 
 
 def maybe_signal_threshold(cfg: Cfg, state: dict, name: str, u: "Usage | None") -> None:
@@ -1203,15 +1288,11 @@ def maybe_signal_threshold(cfg: Cfg, state: dict, name: str, u: "Usage | None") 
     event carries only a utilisation, so the figure is the highest across the
     windows that can trigger rotation; emitting one line per window would be
     indistinguishable noise."""
-    if not cfg.signal or u is None or u.error or not name or name == LIVE_PSEUDO:
+    if not cfg.signal or not name or name == LIVE_PSEUDO:
         return
-    pcts = [(u.session_pct, u.session_reset), (u.weekly_pct, u.weekly_reset)]
-    if cfg.mode == "scoped":
-        pcts.append((u.scoped_pct, u.scoped_reset))
-    live = [effective_pct(p, r) for p, r in pcts if p is not None]
-    if not live:
+    pct = rotation_utilisation(u, cfg)
+    if pct is None:
         return
-    pct = max(live)
     # utilisation falling below a mark means a window reset: let it fire again
     crossed = {m for m in (state.get("signal_crossed") or []) if m <= pct}
     for mark in SIGNAL_MARKS:
@@ -1321,9 +1402,60 @@ def is_exhausted(u: Usage | None, cfg: Cfg, t: float | None = None) -> str | Non
     if cfg.mode == "scoped" and window_spent(u.scoped_pct, u.scoped_reset, cfg.scoped_threshold, t):
         return (f"{(u.scoped_label or 'scoped').lower()} weekly "
                 + pct_text(u, "scoped", u.scoped_pct))
-    if window_spent(u.weekly_pct, u.weekly_reset, 99.5, t):
+    if window_spent(u.weekly_pct, u.weekly_reset, FULL_PCT, t):
         return "weekly " + pct_text(u, "weekly", u.weekly_pct)
     return None
+
+
+def blocked_until(u: Usage | None, cfg: Cfg, t: float | None = None) -> float | None:
+    """The moment an account that is *refusing requests now* stops doing so,
+    or None if it is not refusing.  A window over ccroll's rotation
+    threshold is spent for rotation's purposes but still serves requests;
+    what holds a session is a window the endpoint reports full (FULL_PCT),
+    and it holds until the latest such window resets.  The scoped window
+    counts only in scoped mode, as everywhere else: it blocks that model's
+    requests, which is what the fleet is being run for.  Judged at `t`, so
+    the same reading can be asked whether the account will still be
+    refusing a lead time from now."""
+    if u is None or u.error:
+        return None
+    t = now() if t is None else t
+    resets = []
+    for pct, reset in ((u.session_pct, u.session_reset), (u.weekly_pct, u.weekly_reset)) + (
+            ((u.scoped_pct, u.scoped_reset),) if cfg.mode == "scoped" else ()):
+        if window_spent(pct, reset, FULL_PCT, t) and reset and reset > t:
+            resets.append(reset)
+    return max(resets) if resets else None
+
+
+def parking_target(usages: dict, cfg: Cfg, exclude: str | None,
+                   t: float | None = None) -> str | None:
+    """The account to park on for a peak-hour hold: any that is refusing
+    requests now.  Among several, the one that stays refused longest, so the
+    hold needs the fewest re-parks; the name breaks ties so the same fleet
+    always resolves the same way."""
+    t = now() if t is None else t
+    pool = [(blocked_until(u, cfg, t), n) for n, u in usages.items()
+            if n != exclude and n != LIVE_PSEUDO and u and not u.error]
+    pool = [(-until, n) for until, n in pool if until is not None]
+    return min(pool)[1] if pool else None
+
+
+def verified_parking(cfg: Cfg, usages: dict, active: str | None) -> str | None:
+    """parking_target, confirmed by a fresh read: fleet data can be a scan
+    old, and an account that has since reset would not hold anyone."""
+    skip: set[str] = set()
+    for _ in range(MAX_TARGET_TRIES):
+        pool = {n: u for n, u in usages.items() if n not in skip}
+        target = parking_target(pool, cfg, exclude=active)
+        if not target:
+            return None
+        fresh = usage_for(get_account(cfg, target).cred_path)
+        if not fresh.error:
+            usages[target] = fresh
+            if blocked_until(fresh, cfg, now() + cfg.lead) is not None:
+                return target
+        skip.add(target)
 
 
 def rotation_usage(last_good: dict, name: str, u: Usage | None) -> tuple[Usage | None, float | None]:
@@ -2246,9 +2378,93 @@ def cmd_watch(cfg: Cfg, a: Ansi) -> int:
                 measure_preload(state, usages, cfg)
                 maybe_signal_threshold(cfg, state, name, usages[key])
                 maybe_signal_reset(cfg, state, name, usages[key])
-                maybe_signal_expected(cfg, state, name, usages[key], not paused)
+                maybe_signal_expected(cfg, state, name, usages[key], not paused,
+                                      scheduled=scheduled_swap(), holding=bool(hold_window()))
                 save_state(cfg, state)
         next_active_poll = now() + cfg.interval
+
+    def hold_window() -> tuple[float, float] | None:
+        """The peak range to sit out right now, if any: inside the range,
+        not released by [r] for this range, and rotation not paused (the
+        hold is an automatic swap like any other)."""
+        if paused or not cfg.peak:
+            return None
+        win = peak_window(cfg)
+        if not win or win[0] > now() or state.get("peak_released") == win[0]:
+            return None
+        return win
+
+    def scheduled_swap() -> float | None:
+        """A moment ccroll already knows it will swap at, for the
+        switch_expected announcement: the coming hold's start (when there is
+        something to park on and the active account is not blocked already),
+        or during a hold the earlier of the parked account's release — a lead
+        ahead of it, when ccroll re-parks — and the hold's end."""
+        active = state.get("active")
+        if paused or not cfg.peak or not active:
+            return None
+        win = peak_window(cfg)
+        if not win:
+            return None
+        start, end = win
+        u = usages.get(active)
+        until = blocked_until(u, cfg)
+        if hold_window():
+            if until is None:
+                return None               # the park itself is due on the next tick
+            release = until - cfg.lead
+            if release < end and not parking_target(usages, cfg, active):
+                return None               # nothing to re-park on: no swap to announce
+            return min(end, release)
+        if start > now() and state.get("peak_released") != start and until is None \
+                and parking_target(usages, cfg, active):
+            return start
+        return None
+
+    def hold_in_place(active: str, u_act: "Usage | None", start: float, end: float) -> None:
+        """Peak-hour hold: the desired state is an active account that is
+        refusing requests, so every session waits out a usage limit — the
+        same thing they do for any spent account — until the hold ends by
+        clock or [r].  Not blocked (or about to stop being, within the lead):
+        park on one that is.  Missing data never swaps."""
+        nonlocal notice
+        if u_act is None:
+            return
+        if blocked_until(u_act, cfg, now() + cfg.lead) is not None:
+            if state.get("peak_hold") != start:
+                state["peak_hold"] = start
+                add_event(state, f"peak-hour hold: {active} is refusing requests already; "
+                                 f"staying until {fmt_local(cfg, end)}")
+                save_state(cfg, state)
+            clear_hold_notice()
+            return
+        target = verified_parking(cfg, usages, active)
+        if not target:
+            notice = (f"peak-hour hold: no account is refusing requests, so nothing to park "
+                      f"on — {active} keeps working until one is")
+            return
+        clear_hold_notice()
+        reason = f"peak-hour hold until {fmt_local(cfg, end)}"
+        if state.get("peak_hold") == start:
+            reason = f"re-parked, {active} was about to free up · " + reason
+        try:
+            # preemptive: the account left was not spent, so its cycle goes
+            # on.  The snapshot goes in so switch_done carries the same
+            # fields as any swap, and comes straight back out: nothing
+            # re-primes on an account that refuses it, so a "preload"
+            # measured here would read 0 and skew the median.
+            detail = do_swap(cfg, state, get_account(cfg, target), reason, usages.get(target),
+                             preemptive=True)
+            monitor.note_own_write()
+            state["swap_snapshot"] = None
+            state["peak_hold"] = start
+            save_state(cfg, state)
+            notice = f"parked on {target} ({detail})"
+            poll_active()
+        except CcrollError as e:
+            notice = f"rotation failed: {e}"
+            add_event(state, notice)
+            save_state(cfg, state)
 
     def maybe_rotate():
         nonlocal notice, next_scan
@@ -2267,11 +2483,21 @@ def cmd_watch(cfg: Cfg, a: Ansi) -> int:
         u_act, age = rotation_usage(last_good, active, live)
         if u_act is not None:
             u_act = projected_usage(state, active, u_act)
+        hold = hold_window()
+        if hold:
+            hold_in_place(active, u_act, *hold)
+            return
+        ended = state.get("peak_hold") is not None
+        if ended:
+            state["peak_hold"] = None     # the clock ended it; [r] clears it itself
+            save_state(cfg, state)
         reason = is_exhausted(u_act, cfg)
         if reason is None:
             reason = about_to_exhaust(state, active, u_act, cfg)
         if reason and age is not None:
             reason += f" · usage read: {live.error if live else 'unavailable'}"
+        if reason and ended:
+            reason = "peak-hour hold ended · " + reason
         if not reason:
             clear_hold_notice()
             if cfg.preempt:
@@ -2306,7 +2532,8 @@ def cmd_watch(cfg: Cfg, a: Ansi) -> int:
         """Drop a stale "nothing has headroom" banner once that stops being
         true — it outlived its condition and read as a live state."""
         nonlocal notice
-        if notice.startswith(("all accounts exhausted", "active account exhausted")):
+        if notice.startswith(("all accounts exhausted", "active account exhausted",
+                              "peak-hour hold:")):
             notice = ""
 
     def maybe_preempt(active: str):
@@ -2342,9 +2569,12 @@ def cmd_watch(cfg: Cfg, a: Ansi) -> int:
                   else "weekly·all≥99%")
         early = (f" · early to next reset when runway>{cfg.preempt_runway / 3600:g}h"
                  + (" +touch" if cfg.touch else "")) if cfg.preempt else ""
+        win = peak_window(cfg)
+        peak = (a.dim("  ·  ") + a.dim(f"peak hold {fmt_local(cfg, win[0])[:5]}–{fmt_local(cfg, win[1])}")
+                if win else "")
         mode = (a.red("rotation PAUSED") if paused
                 else a.green(f"auto-rotate at session≥{cfg.threshold:.0f}% / {govern} "
-                             f"or ≤{cfg.lead:.0f}s from a limit{early}"))
+                             f"or ≤{cfg.lead:.0f}s from a limit{early}")) + peak
         head = a.bold(f"ccroll {CCROLL_VERSION}") + a.dim("  ·  ") + mode + a.dim("  ·  ") + fmt_clock(now())
         lines = [head, ""]
         view = merged_view(usages, last_good, state)
@@ -2358,6 +2588,14 @@ def cmd_watch(cfg: Cfg, a: Ansi) -> int:
                 lines.append(a.red(f"  ⚠ rotating early: {soon}"))
             lines += [""] + render_fleet(a, state, active, view[active], cfg,
                                          readable_accounts(accounts, usages), label, usages=usages)
+        hold = hold_window()
+        if hold and active:
+            until = blocked_until(view.get(active), cfg)
+            held = (f"parked on {active} · refuses requests for {fmt_dur(until - now())}"
+                    if until else f"{active} is not refusing requests — looking for an account that is")
+            lines += ["", a.inverse(a.yellow(" PEAK-HOUR HOLD ")) + a.yellow(
+                f"  {held}  ·  resumes at {fmt_local(cfg, hold[1])} "
+                f"(in {fmt_dur(hold[1] - now())}) or on [r]")]
         target = pick_target(usages, cfg, exclude=active, preload=preload_estimate(state))
         if target:
             lines += ["", a.dim("next in line: ") + a.green(target)
@@ -2409,6 +2647,15 @@ def cmd_watch(cfg: Cfg, a: Ansi) -> int:
                     paused = not paused
                     notice = "auto-rotation paused" if paused else "auto-rotation resumed"
                 elif key == "r":
+                    hold = hold_window()
+                    if hold:
+                        # [r] ends the hold for this range: the rotation that
+                        # follows is the ordinary one, and no re-park until
+                        # the next day's range
+                        state["peak_released"] = hold[0]
+                        state["peak_hold"] = None
+                        add_event(state, "peak-hour hold ended by keypress")
+                        clear_hold_notice()
                     target = verified_target(cfg, usages, state.get("active"), preload_estimate(state))
                     if target:
                         try:
@@ -2656,6 +2903,14 @@ def main(argv: list[str] | None = None) -> int:
                         "tail (default <claude-dir>/account-switch)")
     w.add_argument("--no-signal", action="store_true",
                    help="do not write the account-switch feed at all")
+    w.add_argument("--peak-hold", metavar="HH:MM-HH:MM", default=PEAK_HOLD_DEFAULT,
+                   help="daily clock range to sit out: at its start ccroll parks the live "
+                        "credentials on an account that is already refusing requests, so every "
+                        "session waits out a usage limit as usual, and rotates on normally at its "
+                        f"end or when you press r (default {PEAK_HOLD_DEFAULT} in --peak-tz)")
+    w.add_argument("--peak-tz", metavar="ZONE", default=PEAK_TZ_DEFAULT,
+                   help=f"IANA time zone the --peak-hold clock is read in (default {PEAK_TZ_DEFAULT})")
+    w.add_argument("--no-peak-hold", action="store_true", help="never sit out peak hours")
     w.add_argument("--sync-identity", action="store_true", help="also point Claude Code's displayed identity (the `oauthAccount` block in its global config) at the account swapped to, so /status stops naming the previous one; auth already follows the swap without this. Off by default: running sessions cache that config in memory, so the correction usually shows up only in newly started sessions, and a session that rewrites the file from memory undoes it")
 
     sub.add_parser("status", help="one-shot usage table for all accounts")
@@ -2673,10 +2928,10 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("list", help="accounts and token expiries")
 
     args = p.parse_args(argv)
-    cfg = Cfg(args)
     a = Ansi(enabled=sys.stdout.isatty() and not args.no_color)
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     try:
+        cfg = Cfg(args)                   # can reject a --peak-hold range or --peak-tz
         cmd = args.cmd or "watch"
         if cmd == "watch":
             return cmd_watch(cfg, a)
