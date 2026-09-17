@@ -18,10 +18,11 @@ live dashboard in its own terminal:
 it polls every account's usage through the free OAuth usage endpoint,
 highlights the active account, estimates burn rates and time-to-limit from a
 rolling time series, and hot-swaps to the account whose weekly headroom would
-otherwise expire soonest when the active one approaches a limit.  A daily
-peak-hour range (default 05:00-11:00 America/Los_Angeles) is sat out by
-parking on an account that is already refusing requests, so every session
-waits out a usage limit as it would anyway, and rotating on at the end.
+otherwise expire soonest when the active one approaches a limit.  With
+--peak-hold, a daily clock range (the peak hours, 05:00-11:00
+America/Los_Angeles) is sat out by parking on an account that is already
+refusing requests, so every session waits out a usage limit as it would
+anyway, and rotating on at the end.
 
 Stdlib only.  Linux (and any platform where Claude Code keeps credentials in
 a plain file rather than a keychain).
@@ -111,7 +112,7 @@ EARLY_MIN_PCT = 50              # burn-based early rotation only from here up: b
                                 # (the post-swap re-prime spike), not a sustained rate
 FULL_PCT = 99.5                 # a window the endpoint reports as 100%: the account is
                                 # actually being refused there, not merely past a threshold
-PEAK_HOLD_DEFAULT = "05:00-11:00"   # local clock range (in PEAK_TZ_DEFAULT) to sit out
+PEAK_HOLD_EXAMPLE = "05:00-11:00"   # the peak range --peak-hold is meant for (off unless given)
 PEAK_TZ_DEFAULT = "America/Los_Angeles"
 SIGNAL_DIRNAME = "account-switch"   # under the live Claude config dir
 SIGNAL_EVENTS_FILE = "events.jsonl"
@@ -391,8 +392,8 @@ class Cfg:
         # spent account, and resume by an ordinary rotation at its end.
         self.peak = None
         self.peak_tz = None
-        if not getattr(args, "no_peak_hold", False):
-            self.peak = parse_clock_range(getattr(args, "peak_hold", None) or PEAK_HOLD_DEFAULT)
+        if getattr(args, "peak_hold", None):
+            self.peak = parse_clock_range(args.peak_hold)
             tz = getattr(args, "peak_tz", None) or PEAK_TZ_DEFAULT
             try:
                 self.peak_tz = zoneinfo.ZoneInfo(tz)
@@ -2903,14 +2904,14 @@ def main(argv: list[str] | None = None) -> int:
                         "tail (default <claude-dir>/account-switch)")
     w.add_argument("--no-signal", action="store_true",
                    help="do not write the account-switch feed at all")
-    w.add_argument("--peak-hold", metavar="HH:MM-HH:MM", default=PEAK_HOLD_DEFAULT,
-                   help="daily clock range to sit out: at its start ccroll parks the live "
+    w.add_argument("--peak-hold", metavar="HH:MM-HH:MM", default=None,
+                   help="daily clock range to sit out (off unless given; the peak hours are "
+                        f"{PEAK_HOLD_EXAMPLE} in {PEAK_TZ_DEFAULT}): at its start ccroll parks the live "
                         "credentials on an account that is already refusing requests, so every "
                         "session waits out a usage limit as usual, and rotates on normally at its "
-                        f"end or when you press r (default {PEAK_HOLD_DEFAULT} in --peak-tz)")
+                        "end or when you press r")
     w.add_argument("--peak-tz", metavar="ZONE", default=PEAK_TZ_DEFAULT,
                    help=f"IANA time zone the --peak-hold clock is read in (default {PEAK_TZ_DEFAULT})")
-    w.add_argument("--no-peak-hold", action="store_true", help="never sit out peak hours")
     w.add_argument("--sync-identity", action="store_true", help="also point Claude Code's displayed identity (the `oauthAccount` block in its global config) at the account swapped to, so /status stops naming the previous one; auth already follows the swap without this. Off by default: running sessions cache that config in memory, so the correction usually shows up only in newly started sessions, and a session that rewrites the file from memory undoes it")
 
     sub.add_parser("status", help="one-shot usage table for all accounts")
