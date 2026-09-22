@@ -402,7 +402,7 @@ class Cfg:
         # which weekly limit governs exhaustion + next-account choice:
         # "scoped" = the per-model weekly limit (Fable on current Max plans),
         # "weekly" = the all-models weekly limit.
-        self.mode = getattr(args, "by", None) or "scoped"
+        self.mode = getattr(args, "by", None) or "weekly"
 
 
 def list_accounts(cfg: Cfg) -> list[Account]:
@@ -2863,10 +2863,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--root", help="account store dir (default ~/.claude-accounts)")
     p.add_argument("--claude-dir", help="live Claude config dir (default $CLAUDE_CONFIG_DIR or ~/.claude)")
     p.add_argument("--no-color", action="store_true")
-    p.add_argument("--by", choices=("scoped", "weekly"), default="scoped",
+    p.add_argument("--by", choices=("scoped", "weekly"), default="weekly",
                    help="which weekly limit governs rotation and next-account choice: "
                         "'scoped' = the per-model weekly limit (Fable on current Max plans), "
-                        "'weekly' = the all-models weekly limit (default: scoped)")
+                        "'weekly' = the all-models weekly limit (default: weekly)")
     sub = p.add_subparsers(dest="cmd")
 
     w = sub.add_parser("watch", help="live dashboard + auto-rotation (default)")
