@@ -8,7 +8,7 @@ take 25% of your session token quota. And switching by hand — `/login`, browse
 ccroll removes the chore. It runs in its own terminal as a live dashboard over all of your accounts, estimates when the active one will hit its limits, and **hot-swaps the live credentials to the account whose unused quota would otherwise expire first** — while your session keeps running, untouched.
 
 ```
-ccroll 0.1.0  ·  auto-rotate at session≥95% / fable≥97% or ≤60s from a limit · early to next reset when runway>3h  ·  22:04:31
+ccroll 0.1.0  ·  auto-rotate at session≥99% / fable≥97% or ≤60s from a limit · early to next reset when runway>3h  ·  22:04:31
 
    Account           Session (5h)      Weekly · all      Weekly · Fable    Status
 ─  ────────────────  ────────────────  ────────────────  ────────────────  ───────
@@ -100,7 +100,7 @@ All the tuning flags below belong to `watch`. `switch` accepts the three that ap
 
 ccroll rotates away from the active account when any of these hold:
 
-- session (5-hour) usage ≥ `--threshold` (default **95%**) — proactive, so you never see the "limit reached" banner;
+- session (5-hour) usage ≥ `--threshold` (default **99%**) — proactive, so you never see the "limit reached" banner;
 - the governing weekly limit is (nearly) spent;
 - **the burn says a limit is closer than `--lead` seconds** (default 60, or one poll interval if that is longer) — on any window: session, the governing weekly limit, or weekly-all;
 - the API reports the account as blocked.
@@ -133,7 +133,7 @@ In simulation against fleets of 4–19 accounts under steady, back-loaded and bu
 
 ## Peak-hour hold
 
-With `--peak-hold 05:00-11:00` ccroll sits out a daily clock range — those are the peak hours, read on the **America/Los_Angeles** clock unless `--peak-tz` says otherwise — without the running sessions being told anything new. It is off unless asked for. At the start of the range it rotates, exactly as it rotates for any other reason, onto an account that is **already refusing requests**: one with a window the endpoint reports full (100 %; ccroll's own 95 % threshold does not count, an account past it still serves). Every session then does what it does whenever it lands on a spent account — waits out the usage limit — and at the end of the range, or the moment you press `r`, an ordinary rotation moves it on to the account that is next in line by the usual rules. The dashboard shows a `PEAK-HOUR HOLD` line for the duration, naming the parked account, how long it stays refused, when the hold ends and that `r` ends it now.
+With `--peak-hold 05:00-11:00` ccroll sits out a daily clock range — those are the peak hours, read on the **America/Los_Angeles** clock unless `--peak-tz` says otherwise — without the running sessions being told anything new. It is off unless asked for. At the start of the range it rotates, exactly as it rotates for any other reason, onto an account that is **already refusing requests**: one with a window the endpoint reports full (100 %; ccroll's own `--threshold` does not count, an account past it still serves). Every session then does what it does whenever it lands on a spent account — waits out the usage limit — and at the end of the range, or the moment you press `r`, an ordinary rotation moves it on to the account that is next in line by the usual rules. The dashboard shows a `PEAK-HOUR HOLD` line for the duration, naming the parked account, how long it stays refused, when the hold ends and that `r` ends it now.
 
 The contract towards the sessions is untouched. The park is announced with `switch_expected` about three minutes ahead, like a predicted swap, and completes with a `switch_done` carrying the same fields; the resume at the end of the range is announced the same way, and `r` is as immediate as it always was. Nothing in the feed says why a swap happened, and readers already have to cope with a `switch_done` onto a spent account, because that is what "all accounts exhausted" looks like.
 
