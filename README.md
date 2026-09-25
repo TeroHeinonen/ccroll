@@ -91,6 +91,9 @@ That's it. Work normally in your Claude Code session(s). When the active account
 | `ccroll adopt` | Save the current live login into the store (under its email) and mark it active — the identity is taken from the live config too, but only when that config still names the same account |
 | `ccroll switch <email>` | Hot-swap the live credentials right now (a unique prefix is enough: `ccroll switch ops`) |
 | `ccroll list` | Accounts and token expiries |
+| `ccroll client --master HOST` | On another machine: let the ccroll on `HOST` rotate this machine's live login too; saved after the first link, then just `ccroll client` (see [Multiple machines](#multiple-machines-master-and-clients)) |
+| `ccroll release HOST` | Free the account an offline client host holds |
+| `ccroll relay` | Internal: what a client runs on the master through ssh |
 
 Global flags, valid before any command: `--root` (account store, default `~/.claude-accounts`), `--claude-dir` (live config dir, default `$CLAUDE_CONFIG_DIR` or `~/.claude`), `--by {scoped,weekly}`, `--no-color`, `--version`.
 
@@ -129,7 +132,7 @@ In simulation against fleets of 4–19 accounts under steady, back-loaded and bu
 
 **Stale readings don't strand an account.** A percentage whose reset time has already passed is the endpoint lagging behind a window that has rolled over — an account reported at 100% with an expired reset reads 0% a minute later. So every rule that weighs a percentage against a threshold ignores that window rather than counting the account as spent: the exhaustion test, the candidate filter, the burn-based early rotation, the recovery estimate and the utilisation reported to other sessions all read it as free, and the fresh read before every swap keeps the choice honest. Getting this right in only some of those places is worse than nowhere, because an account can then be judged not-spent and simultaneously not-good-enough, which is how the most perishable account in a fleet ends up passed over 85 seconds after its window reset. The dashboard reads the same way, so what you see is what rotation is acting on; a rolled-over window shows its inferred 0% dimmed, under `↺rolled`, rather than the figure the endpoint is still serving.
 
-**A failed read doesn't freeze rotation either.** Missing data still never rotates, with one exception: when the *active* account's own usage read fails, which is exactly what an account being throttled does, ccroll falls back to its last error-free snapshot if that is under 15 minutes old and its window has not since reset — projected forward by its age at the measured burn, like any other reading. A window's percentage only rises until it resets, so a recent reading is a sound floor: sound for "this account is spent", and the one thing it cannot support is "it still has room". The alternative is a live session pinned to an account nobody can see. The rotation reason then names the projection and the underlying read error. A 429 from the usage endpoint is not a penalty the poll earned, so it is not backed off from. The endpoint's per-account limiter is shared with the running CLI, which fetches usage itself whenever its requests are being held at a limit — exactly the minutes an account is spent or burning hard. The samples show it: one account answered every other read with a 429 for the two hours it sat at 100% with no work running, and another read cleanly once a minute for twenty minutes and then failed the moment its agents were being held, with nothing changed on ccroll's side. An earlier doubling back-off (a minute, then two, up to a scan interval) only kept those accounts dark longer; the minute cadence is what the endpoint accepts at idle, so a throttled account is simply asked again at the next poll — unless the 429 carried a `Retry-After`, which is honoured to the second. The Status column carries the server's own message, so the next throttle says which limiter answered. Meanwhile the row keeps showing its last good numbers with the error in the Status column instead of going blank, and for the active account the burn panel shows both the raw reading and the projected figure rotation is acting on.
+**A failed read doesn't freeze rotation either.** Missing data still never rotates, with one exception: when the *active* account's own usage read fails, which is exactly what an account being throttled does, ccroll falls back to its last error-free snapshot if that is under 15 minutes old and its window has not since reset — projected forward by its age at the measured burn, like any other reading. A window's percentage only rises until it resets, so a recent reading is a sound floor: sound for "this account is spent", and the one thing it cannot support is "it still has room". The alternative is a live session pinned to an account nobody can see. The rotation reason then names the projection and the underlying read error. A 429 from the usage endpoint is not a penalty the poll earned, so it is not backed off from. The endpoint's per-account limiter is shared with the running CLI, which fetches usage itself whenever its requests are being held at a limit — exactly the minutes an account is spent or burning hard. The samples show it: one account answered every other read with a 429 for the two hours it sat at 100% with no work running, and another read cleanly once a minute for twenty minutes and then failed the moment its agents were being held, with nothing changed on ccroll's side. An earlier doubling back-off (a minute, then two, up to a scan interval) only kept those accounts dark longer; the minute cadence is what the endpoint accepts at idle, so a throttled account is simply asked again at the next poll — unless the 429 carried a `Retry-After`, which is honoured to the second. Meanwhile the row keeps showing its last good numbers instead of going blank or turning into an error: the Status column says how old they are and why the newer read failed (`cached 12m · throttled`). A window whose reset has passed since is drawn as rolled over, so a cached figure is never shown as more than it is. Only an account with no good reading at all shows the error itself — for a throttle, the server's own message, which says which limiter answered — and for the active account the burn panel shows both the raw reading and the projected figure rotation is acting on.
 
 ## Peak-hour hold
 
@@ -143,7 +146,7 @@ The hold is a state, not a single act. Its desired condition is *the active acco
 
 `--peak-hold HH:MM-HH:MM` turns it on and sets the range (a range past midnight is fine); `--peak-tz` is the IANA zone its clock is read in — the range is resolved on that wall clock, so it stays at 05:00 local across a DST change.
 
-Tuning: `--threshold`, `--scoped-threshold`, `--lead` (seconds of burn-predicted headroom at which to rotate early, default 60 or one poll interval if longer), `--interval` (active-account poll, default 60 s), `--scan` (full-fleet scan, default 300 s), `--preempt-runway` (hours, default 3), `--no-preempt`, `--touch`, `--grace` (post-swap seconds without burn-based rotation or pre-emption, default 300), `--preempt-max-cost` (percent of the governing window a swap may cost before pre-emption is skipped, default 5), `--cooldown` (default 0), `--no-rotate` (observe only), `--peak-hold`, `--peak-tz` (off unless given, see **Peak-hour hold**), `--sync-identity` (off by default, see **Caveats**), `--signal-dir`, `--no-signal` (see **Account-switch signals**).
+Tuning: `--threshold`, `--scoped-threshold`, `--lead` (seconds of burn-predicted headroom at which to rotate early, default 60 or one poll interval if longer), `--interval` (active-account poll, default 60 s), `--scan` (full-fleet scan, default 600 s), `--preempt-runway` (hours, default 3), `--no-preempt`, `--touch`, `--grace` (post-swap seconds without burn-based rotation or pre-emption, default 300), `--preempt-max-cost` (percent of the governing window a swap may cost before pre-emption is skipped, default 5), `--cooldown` (default 0), `--no-rotate` (observe only), `--peak-hold`, `--peak-tz` (off unless given, see **Peak-hour hold**), `--sync-identity` (off by default, see **Caveats**), `--signal-dir`, `--no-signal` (see **Account-switch signals**).
 
 ## Burn estimates
 
@@ -198,16 +201,119 @@ Three events, and nothing else — no heartbeats and no countdowns, because ever
 
 **Two things ccroll deliberately does not do.** It does not edit `~/.claude/settings.json`; it only checks at startup that `"autoContinueAtUsageLimit": true` is set (so the CLI waits out a usage limit instead of prompting) and warns if it is not, because that file is yours. And it does not send keystrokes to other terminals to dismiss a usage-limit dialog — ccroll has no handle on those sessions, so that fallback has to stay manual.
 
+## Multiple machines (master and clients)
+
+Run sessions on two or more computers and each should be on a *different* account, the fleet still drained in the best order. One machine is the **master**: it keeps the account store and makes every rotation decision, for its own live login and for every client's. The others run `ccroll client` and carry out the swaps it sends. The examples use `USER@MASTER` for the master's ssh login (e.g. `me@192.168.1.20` or `me@desk.local`) and `192.168.1.0/24` for your LAN.
+
+### 1. Prerequisites
+
+- **ccroll on every machine**, the same version everywhere (a mismatch is refused, and both sides say so).
+- **All accounts on the master**, registered there with `ccroll add` (and `ccroll adopt` for the master's own current login) exactly as in the [Quick start](#quick-start). The store never leaves the master.
+- **Clients need no logins.** A client with no Claude login at all is given the best free account the moment it links. A client that is already logged in to one of the stored accounts keeps it.
+
+### 2. On the master
+
+1. Run the ordinary dashboard: `ccroll`. It is the master from the start and listens on a Unix socket in its store (`~/.claude-accounts/.ccroll/master.sock`, mode 0600). Nothing is opened on the network.
+2. Make sure **sshd** is running (`systemctl is-active ssh`). Clients reach the master only through ssh, which authenticates them and encrypts everything that crosses the network, credentials included.
+3. Let **port 22/tcp** in from the LAN if a firewall is on, for example with ufw:
+   ```bash
+   sudo ufw allow from 192.168.1.0/24 to any port 22 proto tcp
+   ```
+4. Make sure **`ccroll` is on the `PATH` for non-interactive ssh**, which is what the client runs (`ssh USER@MASTER ccroll relay`). Check from a client once key access works (step 3):
+   ```bash
+   ssh -o BatchMode=yes USER@MASTER 'command -v ccroll'
+   ```
+   If it prints nothing (pipx and `~/.local/bin` are often missing from a non-interactive `PATH`), point the client at it with `--relay-cmd`:
+   ```bash
+   ccroll client --relay-cmd "ssh USER@MASTER ~/.local/bin/ccroll relay"
+   # a non-default port or store works the same way:
+   ccroll client --relay-cmd "ssh -p 2222 USER@MASTER python3 /opt/ccroll/ccroll.py --root /data/accounts relay"
+   ```
+
+### 3. On each client (one-time)
+
+```bash
+ssh-copy-id USER@MASTER              # key-based ssh: the client never types a password
+ccroll client --master USER@MASTER   # the first link; saved once it works
+```
+
+After that, on that machine, just run:
+
+```bash
+ccroll client
+```
+
+The link is saved in `~/.claude-accounts/.ccroll/client.json` **only after the master has answered**, so a mistyped host is never remembered. Options given later override the saved ones and are saved in turn. ccroll says what changed when it exits (`saved link updated: master … (was …)`). `--name` sets the name this machine has on the master (the hostname by default). Renaming a machine that holds an account moves the hold to the new name. `ccroll client --forget` drops the saved link and keeps the rest of the client's state.
+
+A machine saved as a client asks before starting a master (`ccroll` on it warns, and asks or refuses without a terminal; `--as-master` overrides). Two masters would be two independent engines handing out one pool of accounts.
+
+### 4. What the displays show
+
+The **master's** dashboard gains two things:
+
+- A **Host** column: which machine is on each account. ► marks the one you are looking from, `✗ offline` a host whose link is down, and `→ host` a swap under way.
+- A **hosts** table: each machine's live account, its link, its next limit at its own burn, its session burn and its last swap. The link is `linked · N sessions`, counting only Claude Code processes on that machine's live config dir; `silent since …` when its heartbeats stop; or `offline since …`.
+
+The event log names the host each line happened on. While the master waits on the network (a scan, a fresh read before a swap), the top line says so (`⟳ scanning 14 accounts…`). Links are served throughout: heartbeats, views and resizes don't wait for it.
+
+A **client** shows the same fleet view, rendered by the master at the client's own terminal size with the client's lane as the marked one. It is pushed whenever it changes, not on a timer. On top the client adds which master it uses, which account this machine is live on, and the link:
+
+```
+ccroll client  ·  laptop → master desk (me@192.168.1.20)  ·  live: ops@example.com  ·  14:02:11
+● linked  ·  fleet view from the master, updated 14:02:05
+ccroll 0.1.0  ·  auto-rotate at session≥99% / weekly·all≥99% …
+   Account           Host            Session (5h)      Weekly · all      …
+   tero@example.com  desk             62% ↺0d 02h 10m   31% ↺3d 02h 40m
+►  ops@example.com   laptop           12% ↺0d 04h 41m    8% ↺6d 01h 33m
+hosts · 2 lanes
+   desk (master)     tero@example.com  this machine         session in ≈0d 02h 40m  14.2%/h
+►  laptop            ops@example.com   linked · 3 sessions  post-swap grace         —
+```
+
+If the master goes away, the client keeps the last view on screen, dimmed under a **STALE** banner, and says since when and why:
+
+```
+✗ master unreachable since 14:05:40: no ccroll master is running on desk (…) · retry in 42s
+ STALE  view from 14:05:40 · this machine keeps working on ops@example.com; rotation resumes when the master is back
+```
+
+### 5. Day to day
+
+- **`r` on a client** asks the master to rotate *that* machine now. During a peak-hour hold it ends the hold for that machine only. `q` quits. The master's own keys work as always on its own lane.
+- **Clients come and go freely.** A client that stops or loses its network keeps its account reserved. Reclaiming it automatically could log out a session still running behind a split network. It picks up again when it links. ssh notices a dead network within about three `--interval` (60 s by default) and the client relinks on its own.
+- **`ccroll release HOST`** (on the master) frees the account of a client that is gone for good. It is safe only when that machine is really off the account: shut down, or logged out. If it is in fact still running there, two machines would share one refresh token, and the first refresh would log the other out. That is why ccroll warns first and refuses a host that is still linked.
+- **Signals**: each client writes the ordinary account-switch feed for its own sessions, in its own `account-switch/` directory, with the same three events and the same fields. A threshold crossed while a client was offline is announced when it links again. `--no-signal`, `--signal-dir` and `--sync-identity` work on `client` as on `watch`.
+
+**How accounts are shared out.** Every machine is a *lane*, and every lane runs exactly the rotation rules above, with its own burn, grace, swap cost and peak hold. The one difference: an account some lane is live on, or being swapped to, is out of every other lane's pool. So no two machines are ever given the same account, and each still takes the best one left. That holds for peak-hour parking too: each machine parks on a refused account of its own, and one with nothing left to park on keeps working and says why. What a client reports being live on always wins. If two machines do turn out to be on one account (say a manual `/login`), the later arrival is rotated off it. A client whose live login cannot be named at the moment (its profile read failed) keeps its account held until it can be. The fleet forecast adds up every lane's burn against the same accounts.
+
+**Who refreshes what.** A refresh token has exactly one owner at any time. An account a client is live on belongs to that client's Claude Code, which refreshes it as it always does. The client reports every new token to the master. The master reads that account's usage with the token reported and **never refreshes it** itself. When the client leaves the account, the swap result carries the account's newest tokens back into the store. The client keeps that result until the master acknowledges it. Only free accounts are refreshed by the master. `ccroll status` and `ccroll switch` on the master honour this too: `switch` refuses an account a client holds.
+
+### 6. Troubleshooting
+
+| What you see | Why, and what to do |
+|---|---|
+| `no ccroll master is running on …` | ssh worked, but `ccroll` is not running on the master. Start it there; the client links within one `--interval`. |
+| `Permission denied (publickey…)` | Key access is missing. Run `ssh-copy-id USER@MASTER` and check with `ssh -o BatchMode=yes USER@MASTER true`. |
+| `Host key verification failed` | The client has never connected to the master. Run `ssh USER@MASTER true` once interactively and accept the key. |
+| `ccroll: command not found` (or the relay exits at once) | `ccroll` is not on the master's non-interactive `PATH`. Use `--relay-cmd` with the full path (step 2.4). |
+| `Connection timed out` / `refused` | sshd is not running, or a firewall blocks 22/tcp (step 2.2–2.3). |
+| `protocol v… is not the master's v…` | Different ccroll versions. Install the same one on every machine. |
+| `another machine named 'X' is linked` · `refused by the master` | Two machines use one name. Start one with `--name`, or `ccroll release X` if the old machine is gone. A refused client does not retry. |
+| `no client can link: cannot serve …master.sock` | The store's filesystem cannot hold a Unix socket. The master still rotates its own login. Move the store (`--root`) to a local disk. |
+| Rows showing `cached 12m · throttled` | The usage endpoint is throttling reads (429). The row shows the last good reading and its age, not an error. A full scan runs every `--scan` (600 s by default). Raise it if throttling persists with many accounts. |
+
 ## What ccroll writes, and where
 
 - `~/.claude-accounts/<name>/.credentials.json` — each account's tokens (0600), refreshed in place.
 - `~/.claude-accounts/<name>/.claude.json` — that account's own profile, kept for its `oauthAccount` identity. Written by the login `ccroll add` runs, and refreshed on re-add.
-- `~/.claude-accounts/.ccroll/state.json` — active-account marker, per-account emails, burn-rate samples, preload measurements, opaque signal labels and the event log. No secrets.
+- `~/.claude-accounts/.ccroll/state.json` — active-account marker, per-account emails, burn-rate samples, preload measurements, opaque signal labels and the event log; on a master also each client host's lane (its account, its pending swap, its grace and swap cost). No secrets.
+- `~/.claude-accounts/.ccroll/master.sock` — the master's socket (0600), while `ccroll watch` runs.
+- `~/.claude-accounts/.ccroll/client.json` — on a client only (0600): the saved master link, a machine id when `/etc/machine-id` is missing, which account its live login is, swap results the master has not yet acknowledged (these carry the previous account's tokens), and its feed counter.
 - `~/.claude/.credentials.json` (or `$CLAUDE_CONFIG_DIR`) — replaced atomically on each swap; harvested back into the store first so rotated refresh tokens survive.
 - `~/.claude/account-switch/{events.jsonl,state.json}` — the account-switch feed for other sessions (0700 dir): opaque account labels, timestamps and percentages, no emails and no secrets. `--no-signal` turns it off.
 - `~/.claude.json` — **only with `--sync-identity`, and only its `oauthAccount` key** (see the caveats). Never otherwise, and never replaced wholesale: that file also holds every project's session history.
 
-Nothing is ever sent anywhere except Anthropic's own OAuth/usage endpoints.
+Nothing is ever sent anywhere except Anthropic's own OAuth/usage endpoints — and, between your own machines when you run clients, over your own ssh.
 
 ### Token refresh
 
