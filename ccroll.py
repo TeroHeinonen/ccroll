@@ -93,8 +93,6 @@ MAX_TARGET_TRIES = 4            # fresh-read confirmations before giving up on a
 ROLLED_MARK = "rolled"          # reset column for a window whose reset has passed
 RESCAN_MIN_S = 30               # floor on any scheduled rescan, so a stale reset time
                                 # can never turn the watch loop into a scan storm
-LAST_GOOD_MAX_AGE_S = 15 * 60   # how long a cached usage read stands in for a failed one
-                                # when rotation acts on it (the display shows any, aged)
 USAGE_ERROR_MSG_CHARS = 26      # how much of a 429's own message the status column carries
 FRESH_PERISH_RATE = 97 / 168    # %/h an unopened weekly window "loses" by not starting
                                 # its 7-day clock: one full window per week
@@ -1610,8 +1608,8 @@ def is_exhausted(u: Usage | None, cfg: Cfg, t: float | None = None) -> str | Non
 
     A failed read yields None — missing data never rotates.  The watch loop
     handles the one case where that is not enough (the *active* account
-    going unreadable) by falling back to its last good snapshot, projected
-    forward by its age (`projected_usage`).
+    going unreadable) by falling back to its last good snapshot, however
+    old, projected forward by its age (`projected_usage`).
 
     `t` is the moment to judge at (default now): a window whose reset has
     passed by then no longer counts, so the same reading can be asked what
@@ -1692,16 +1690,25 @@ def rotation_usage(last_good: dict, name: str, u: Usage | None) -> tuple[Usage |
     The caller projects it forward by its age (`projected_usage`) before
     judging it; `is_exhausted` ignores any window whose reset has since
     passed.  Returns (usage, age of the snapshot in seconds), age None when
-    the current read is good."""
+    the current read is good.
+
+    The snapshot stands in for as long as the blackout lasts: there is no
+    age past which it stops counting.  Its floor property does not decay —
+    a window still in force can only be at or above what was read, and one
+    whose reset has passed is dropped per window by the same predicate the
+    rules use (`window_rolled`), not by the snapshot's age.  An earlier
+    version gave up after a fixed 15 minutes and returned nothing, which
+    `is_exhausted` rightly never rotates on: zetor@ was read at 82% weekly,
+    its reads failed for an hour while it burned at ~24%/h, and ccroll sat
+    on it through 100% with requests hanging.  Dropping the floor could only
+    ever make rotation *later* than the data allows; keeping it, projected
+    at the measured burn, fires when a real reading would have."""
     if u is not None and not u.error:
         return u, None
     snap = last_good.get(name)
     if snap is None:
         return None, None
-    age = now() - snap.fetched_at
-    if age > LAST_GOOD_MAX_AGE_S:
-        return None, None
-    return snap, age
+    return snap, now() - snap.fetched_at
 
 
 def projected_usage(state: dict, name: str, u: Usage, t: float | None = None) -> Usage:
@@ -1713,11 +1720,16 @@ def projected_usage(state: dict, name: str, u: Usage, t: float | None = None) ->
     threshold, however long the blackout — which is how privacy@ was held at
     "91%" for eleven minutes while it burned through to 100%.  So each window
     is advanced by rate × age, using the same conservative rate the burn
-    rules act on, and capped at 100.  Windows without a burn estimate, or
-    whose reset has passed, are left as read; nothing is projected during
-    the post-swap grace, when no rate exists.  The copy records the raw
-    reading, the rate and the age so a reason or a dashboard line can show
-    its working."""
+    rules act on, and capped at 100.  The age is unbounded: the rate is the
+    one measured before the blackout (the fit is anchored on the newest
+    sample, which a failed read does not add), and a window keeps rising at
+    it until its reset.  Windows without a burn estimate, or whose reset has
+    passed by `t`, are left as read — the first stays at its lower bound,
+    the second is judged as rolled over (0%) by `effective_pct`, never as
+    the stale figure plus a projection; nothing is projected during the
+    post-swap grace, when no rate exists.  The copy records the raw reading,
+    the rate and the age so a reason or a dashboard line can show its
+    working."""
     t = now() if t is None else t
     age = max(0.0, t - u.fetched_at)
     out = copy.copy(u)
@@ -2162,8 +2174,9 @@ def merged_view(usages: dict, last_good: dict, state=None) -> dict:
         # For display a cached reading stands in for as long as there is one:
         # a window's figure only rises until it resets, and a window whose
         # reset has passed is drawn as rolled over anyway, so the reading is
-        # never shown as more than it is — and its age is on the row.  (How
-        # old a reading *rotation* may act on is `rotation_usage`'s rule.)
+        # never shown as more than it is — and its age is on the row.
+        # Rotation follows the same rule for the active account
+        # (`rotation_usage`): no age limit, rolled windows dropped.
         if u is not None and u.error and snap is not None:
             shown = copy.copy(snap)
             shown.stale_note = u.error
@@ -2176,20 +2189,23 @@ def merged_view(usages: dict, last_good: dict, state=None) -> dict:
 
 
 # --- rendering ------------------------------------------------------------------
-def _pct_cell(a: Ansi, pct, reset):
+def _pct_cell(a: Ansi, pct, reset, estimated: bool = False):
     """One utilisation cell: the figure ccroll acts on, then its reset.
 
     A window whose reset has passed shows the inferred 0% and `↺rolled`
     rather than the stale reading the endpoint is still serving — dimmed,
     because it is a deduction awaiting the next read.  That is distinct
-    from `↺—`, a window that was never opened and is genuinely idle."""
+    from `↺—`, a window that was never opened and is genuinely idle.
+    `estimated`: the figure is a cached reading projected at the measured
+    burn through a read blackout, marked `≈` so it never passes for a
+    reading."""
     if pct is None:
         return a.dim("—"), 1
     if window_rolled(reset):
         plain = f"{effective_pct(pct, reset):.0f}%"
         return (a.dim(f"{plain:>4}") + a.dim(" ↺") + a.dim(ROLLED_MARK),
                 max(len(plain), 4) + 2 + len(ROLLED_MARK))
-    plain = f"{pct:.0f}%"
+    plain = ("≈" if estimated else "") + f"{pct:.0f}%"
     dur, dur_len = fmt_dur3(a, (reset - now()) if reset else None)
     return sev_color(a, pct)(f"{plain:>4}") + a.dim(" ↺") + dur, max(len(plain), 4) + 2 + dur_len
 
@@ -2238,10 +2254,15 @@ def render_table(a: Ansi, rows: list, scoped_label: str) -> list[str]:
         if u is None:
             row = [mark, label, (a.dim("…"), 1), ("", 0), ("", 0), (a.dim("fetching"), 8)]
         else:
+            def est(key: str) -> bool:
+                raw = (u.projected_from or {}).get(key)
+                cur = getattr(u, f"{key}_pct")
+                return bool(u.stale_note) and raw is not None and cur is not None \
+                    and round(cur) != round(raw)
             row = [mark, label,
-                   _pct_cell(a, u.session_pct, u.session_reset),
-                   _pct_cell(a, u.weekly_pct, u.weekly_reset),
-                   _pct_cell(a, u.scoped_pct, u.scoped_reset),
+                   _pct_cell(a, u.session_pct, u.session_reset, est("session")),
+                   _pct_cell(a, u.weekly_pct, u.weekly_reset, est("weekly")),
+                   _pct_cell(a, u.scoped_pct, u.scoped_reset, est("scoped")),
                    _status_cell(a, u)]
         if hosts:
             row.insert(2, host)
