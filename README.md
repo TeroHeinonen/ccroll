@@ -8,7 +8,7 @@ take 25% of your session token quota. And switching by hand — `/login`, browse
 ccroll removes the chore. It runs in its own terminal as a live dashboard over all of your accounts, estimates when the active one will hit its limits, and **hot-swaps the live credentials to the account whose unused quota would otherwise expire first** — while your session keeps running, untouched.
 
 ```
-ccroll 0.1.0  ·  auto-rotate at session≥99% / fable≥97% or ≤60s from a limit · early to next reset when runway>3h  ·  22:04:31
+ccroll 0.1.0  ·  auto-rotate at session≥98% / fable≥97% or ≤60s from a limit · early to next reset when runway>3h  ·  22:04:31
 
    Account           Session (5h)      Weekly · all      Weekly · Fable    Status
 ─  ────────────────  ────────────────  ────────────────  ────────────────  ───────
@@ -103,8 +103,8 @@ All the tuning flags below belong to `watch`. `switch` accepts the three that ap
 
 ccroll rotates away from the active account when any of these hold:
 
-- session (5-hour) usage ≥ `--threshold` (default **99%**) — proactive, so you never see the "limit reached" banner;
-- the governing weekly limit is (nearly) spent;
+- session (5-hour) usage ≥ `--threshold` (default **98%**) — proactive, so you never see the "limit reached" banner;
+- the governing weekly limit reaches its threshold (`--weekly-threshold`, default **98%**, for the all-models limit; `--scoped-threshold` under `--by scoped`);
 - **the burn says a limit is closer than `--lead` seconds** (default 60, or one poll interval if that is longer) — on any window: session, the governing weekly limit, or weekly-all;
 - the API reports the account as blocked.
 
@@ -146,7 +146,7 @@ The hold is a state, not a single act. Its desired condition is *the active acco
 
 `--peak-hold HH:MM-HH:MM` turns it on and sets the range (a range past midnight is fine); `--peak-tz` is the IANA zone its clock is read in — the range is resolved on that wall clock, so it stays at 05:00 local across a DST change.
 
-Tuning: `--threshold`, `--scoped-threshold`, `--lead` (seconds of burn-predicted headroom at which to rotate early, default 60 or one poll interval if longer), `--interval` (active-account poll, default 60 s), `--scan` (full-fleet scan, default 600 s), `--preempt-runway` (hours, default 3), `--no-preempt`, `--touch`, `--grace` (post-swap seconds without burn-based rotation or pre-emption, default 300), `--preempt-max-cost` (percent of the governing window a swap may cost before pre-emption is skipped, default 5), `--cooldown` (default 0), `--no-rotate` (observe only), `--peak-hold`, `--peak-tz` (off unless given, see **Peak-hour hold**), `--sync-identity` (off by default, see **Caveats**), `--signal-dir`, `--no-signal` (see **Account-switch signals**).
+Tuning: `--threshold`, `--scoped-threshold`, `--weekly-threshold` (all-models weekly, default 98), `--lead` (seconds of burn-predicted headroom at which to rotate early, default 60 or one poll interval if longer), `--interval` (active-account poll, default 60 s), `--scan` (full-fleet scan, default 600 s), `--preempt-runway` (hours, default 3), `--no-preempt`, `--touch`, `--grace` (post-swap seconds without burn-based rotation or pre-emption, default 300), `--preempt-max-cost` (percent of the governing window a swap may cost before pre-emption is skipped, default 5), `--cooldown` (default 0), `--no-rotate` (observe only), `--peak-hold`, `--peak-tz` (off unless given, see **Peak-hour hold**), `--sync-identity` (off by default, see **Caveats**), `--signal-dir`, `--no-signal` (see **Account-switch signals**).
 
 ## Burn estimates
 
@@ -261,7 +261,7 @@ A **client** shows the same fleet view, rendered by the master at the client's o
 ```
 ccroll client  ·  laptop → master desk (me@192.168.1.20)  ·  live: ops@example.com  ·  14:02:11
 ● linked  ·  fleet view from the master, updated 14:02:05
-ccroll 0.1.0  ·  auto-rotate at session≥99% / weekly·all≥99% …
+ccroll 0.1.0  ·  auto-rotate at session≥99% / weekly·all≥98% …
    Account           Host            Session (5h)      Weekly · all      …
    tero@example.com  desk             62% ↺0d 02h 10m   31% ↺3d 02h 40m
 ►  ops@example.com   laptop           12% ↺0d 04h 41m    8% ↺6d 01h 33m

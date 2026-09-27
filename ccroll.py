@@ -377,8 +377,9 @@ class Cfg:
         # opt-in: also point the display identity at the account we swap to.
         self.sync_identity = bool(getattr(args, "sync_identity", False))
         self.state_path = os.path.join(self.root, ".ccroll", "state.json")
-        self.threshold = float(getattr(args, "threshold", 99))
+        self.threshold = float(getattr(args, "threshold", 98))
         self.scoped_threshold = float(getattr(args, "scoped_threshold", 97))
+        self.weekly_threshold = float(getattr(args, "weekly_threshold", 98))
         self.interval = max(15, int(getattr(args, "interval", 60)))
         self.scan = max(self.interval, int(getattr(args, "scan", 600)))
         self.cooldown = int(getattr(args, "cooldown", 0))
@@ -1157,7 +1158,7 @@ def fleet_forecast(state: dict, name: str, u: Usage, cfg: Cfg, n_accounts: int) 
         return None if r is None or r[0] < BURN_MIN_RATE else r[0]
 
     govern = "weekly" if cfg.mode == "weekly" else "scoped"
-    govern_thr = 99.5 if cfg.mode == "weekly" else cfg.scoped_threshold
+    govern_thr = cfg.weekly_threshold if cfg.mode == "weekly" else cfg.scoped_threshold
     cycle_h, kind = None, "idle"
     sr = rate("session")
     if sr is not None:
@@ -1171,7 +1172,7 @@ def fleet_forecast(state: dict, name: str, u: Usage, cfg: Cfg, n_accounts: int) 
     swaps_wk = (WEEK_H / cycle_h) if cycle_h else 0.0
 
     windows = []
-    for key, thr in ((govern, govern_thr),) + ((("weekly", 99.5),) if govern != "weekly" else ()):
+    for key, thr in ((govern, govern_thr),) + ((("weekly", cfg.weekly_threshold),) if govern != "weekly" else ()):
         r = rate(key)
         cap = n_accounts * thr
         if r is None:
@@ -1260,7 +1261,7 @@ def fleet_runway(fc: dict, usages: dict, cfg: Cfg, t: float | None = None) -> di
         if w.get("rate") is None:
             continue
         key = w["key"]
-        thr = 99.5 if key == "weekly" else cfg.scoped_threshold
+        thr = cfg.weekly_threshold if key == "weekly" else cfg.scoped_threshold
         demand = (w["work"] + w["handover"]) / WEEK_H          # %/h on this window
         supply, resets = 0.0, []
         for _, u in accts:
@@ -1623,7 +1624,7 @@ def is_exhausted(u: Usage | None, cfg: Cfg, t: float | None = None) -> str | Non
     if cfg.mode == "scoped" and window_spent(u.scoped_pct, u.scoped_reset, cfg.scoped_threshold, t):
         return (f"{(u.scoped_label or 'scoped').lower()} weekly "
                 + pct_text(u, "scoped", u.scoped_pct))
-    if window_spent(u.weekly_pct, u.weekly_reset, FULL_PCT, t):
+    if window_spent(u.weekly_pct, u.weekly_reset, cfg.weekly_threshold, t):
         return "weekly " + pct_text(u, "weekly", u.weekly_pct)
     return None
 
@@ -1825,7 +1826,7 @@ def eta_to_threshold(pct: float | None, rate: float | None, threshold: float) ->
 def threshold_etas(state: dict, name: str, u: Usage, cfg: Cfg) -> list:
     """(key, label, pct, rate, eta-to-threshold) per rotating window."""
     windows = [("session", "session", u.session_pct, u.session_reset, cfg.threshold),
-               ("weekly", "weekly", u.weekly_pct, u.weekly_reset, 99.5)]
+               ("weekly", "weekly", u.weekly_pct, u.weekly_reset, cfg.weekly_threshold)]
     if cfg.mode == "scoped":
         windows.append(("scoped", (u.scoped_label or "scoped").lower() + " weekly",
                         u.scoped_pct, u.scoped_reset, cfg.scoped_threshold))
@@ -2116,7 +2117,7 @@ def recovery_moment(u: Usage, cfg: Cfg, t: float) -> float | None:
     if cfg.mode == "scoped" and window_spent(u.scoped_pct, u.scoped_reset,
                                              cfg.scoped_threshold, t) and u.scoped_reset:
         resets.append(u.scoped_reset)
-    if window_spent(u.weekly_pct, u.weekly_reset, 99.5, t) and u.weekly_reset:
+    if window_spent(u.weekly_pct, u.weekly_reset, cfg.weekly_threshold, t) and u.weekly_reset:
         resets.append(u.weekly_reset)
     resets = [r for r in resets if r > t]
     return max(resets) if resets else None
@@ -3806,7 +3807,7 @@ class Master:
         active = ls.get("active")
         fleet = bool(self.remote)
         govern = (f"{label.lower()}≥{cfg.scoped_threshold:.0f}%" if cfg.mode == "scoped"
-                  else "weekly·all≥99%")
+                  else f"weekly·all≥{cfg.weekly_threshold:.0f}%")
         early = (f" · early to next reset when runway>{cfg.preempt_runway / 3600:g}h"
                  + (" +touch" if cfg.touch else "")) if cfg.preempt else ""
         win = peak_window(cfg)
@@ -4732,9 +4733,11 @@ def main(argv: list[str] | None = None) -> int:
     sub = p.add_subparsers(dest="cmd")
 
     w = sub.add_parser("watch", help="live dashboard + auto-rotation (default)")
-    w.add_argument("--threshold", type=float, default=99, help="rotate when session %% reaches this (default 99)")
+    w.add_argument("--threshold", type=float, default=98, help="rotate when session %% reaches this (default 98)")
     w.add_argument("--scoped-threshold", type=float, default=97,
                    help="rotate when the per-model weekly %% reaches this (default 97)")
+    w.add_argument("--weekly-threshold", type=float, default=98,
+                   help="rotate when the all-models weekly %% reaches this (default 98)")
     w.add_argument("--interval", type=int, default=60, help="active-account poll seconds (default 60)")
     w.add_argument("--lead", type=float, default=None, metavar="SECONDS",
                    help="rotate early once the active account's predicted time to any limit at its "
