@@ -41,11 +41,14 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import concurrent.futures
 import contextlib
 import copy
+import fcntl
+import heapq
+import itertools
 import json
 import os
+import queue
 import re
 import select
 import shlex
@@ -85,10 +88,10 @@ HTTP_TIMEOUT_S = 30
 # a generic UA gets throttled. ccroll performs the same OAuth refresh the CLI
 # performs, on the user's own stored credentials, so it identifies the same way.
 USER_AGENT = "claude-cli/2.1.259 (external, cli)"
-REFRESH_RETRIES = 3             # attempts per refresh when the server throttles
-REFRESH_BACKOFF_S = 2.0         # first backoff; doubles per attempt
-REFRESH_STAGGER_S = 0.35        # spacing between refreshes of different accounts
-MAX_PARALLEL = 8
+REFRESH_RETRIES = 3             # attempts per refresh when the server throttles, in a
+REFRESH_BACKOFF_S = 2.0         # one-shot command only (first backoff; doubles per attempt)
+ACCOUNT_QUERY_PACE_S = 1.0      # the user's rule, not a tuning: at most one request to
+                                # Anthropic per second, from every thread of this process
 MAX_TARGET_TRIES = 4            # fresh-read confirmations before giving up on a swap
 ROLLED_MARK = "rolled"          # reset column for a window whose reset has passed
 RESCAN_MIN_S = 30               # floor on any scheduled rescan, so a stale reset time
@@ -298,9 +301,95 @@ def sev_color(a: Ansi, pct: float | None):
     return a.green
 
 
+# --- the UI thread --------------------------------------------------------------
+# A dashboard (`watch`, `client`) reads keys and serves its links on one
+# thread, and nothing slow may ever run there: a request, a wait for a pacing
+# slot, a wait on a credentials lock.  Those run on worker threads, and their
+# results are applied back on the UI thread.  The check below is the tripwire
+# for a path that was missed: it records the stall (the dashboard logs it)
+# rather than bringing the dashboard down over it.
+UI_THREAD: "threading.Thread | None" = None
+UI_STALLS: list = []                # what ran on the UI thread that must not have
+
+
+def on_ui_thread() -> bool:
+    return UI_THREAD is not None and threading.current_thread() is UI_THREAD
+
+
+def off_ui(what: str) -> None:
+    if on_ui_thread():
+        UI_STALLS.append(what)
+
+
 # --- HTTP -----------------------------------------------------------------------
+class Pacer:
+    """Every request to Anthropic takes a slot, one per ACCOUNT_QUERY_PACE_S,
+    across all threads — the fleet scan, each lane's poll, the fresh read
+    before a swap, token refreshes and profile reads alike — so the fleet
+    never reaches the endpoints as a burst, however many accounts there are.
+
+    Two queues share the slots: urgent requests (a lane's own poll, the
+    reads and refresh a swap depends on, and anything done while holding an
+    account's lock) take the next slot ahead of every waiting scan read, so
+    pacing delays a rotation decision by at most one slot.  Within a queue,
+    first come, first served.  A wait for a slot is a wait on a worker
+    thread; an account held by a Retry-After never asks for one."""
+
+    def __init__(self, pace_s: float):
+        self.pace = pace_s
+        self.cv = threading.Condition()
+        self.next_at = 0.0
+        self.waiting: list = []
+        self.seq = itertools.count()
+
+    def slot(self, urgent: bool = False) -> None:
+        off_ui("a request to Anthropic")
+        me = (0 if urgent else 1, next(self.seq))
+        with self.cv:
+            heapq.heappush(self.waiting, me)
+            try:
+                while True:
+                    t = time.monotonic()
+                    if self.waiting[0] == me:
+                        if t >= self.next_at:
+                            heapq.heappop(self.waiting)
+                            self.next_at = t + self.pace
+                            self.cv.notify_all()
+                            return
+                        self.cv.wait(self.next_at - t)
+                    else:
+                        self.cv.wait()
+            except BaseException:
+                if me in self.waiting:
+                    self.waiting.remove(me)
+                    heapq.heapify(self.waiting)
+                    self.cv.notify_all()
+                raise
+
+
+PACER = Pacer(ACCOUNT_QUERY_PACE_S)
+_pace_ctx = threading.local()
+
+
+@contextlib.contextmanager
+def urgent_requests():
+    """Requests made inside take the urgent queue (see Pacer)."""
+    prev = getattr(_pace_ctx, "urgent", False)
+    _pace_ctx.urgent = True
+    try:
+        yield
+    finally:
+        _pace_ctx.urgent = prev
+
+
 def _http(method: str, url: str, token: str | None, body: dict | None):
-    """Return (status:int|None, body_bytes:bytes, neterr:str|None, headers)."""
+    """Return (status:int|None, body_bytes:bytes, neterr:str|None, headers),
+    once the pacer grants this request its slot."""
+    PACER.slot(getattr(_pace_ctx, "urgent", False))
+    return _send(method, url, token, body)
+
+
+def _send(method: str, url: str, token: str | None, body: dict | None):
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(url, data=data, method=method)
     req.add_header("User-Agent", USER_AGENT)
@@ -472,16 +561,31 @@ def expires_in_s(oauth: dict) -> float | None:
 
 
 # --- OAuth refresh --------------------------------------------------------------
+class Throttled(CcrollError):
+    """The token endpoint answered 429; `retry_after` is the wait it asked
+    for, when it named one."""
+
+    def __init__(self, msg: str, retry_after: float | None):
+        super().__init__(msg)
+        self.retry_after = retry_after
+
+
 def oauth_refresh(oauth: dict) -> dict:
     """Exchange the refresh token for a fresh access token (rotating the
-    refresh token when the server does).  Returns a new claudeAiOauth dict."""
+    refresh token when the server does).  Returns a new claudeAiOauth dict.
+
+    A 429 is retried after a backoff only in a one-shot command.  Under a
+    dashboard the backoff would be a sleep on a worker that holds the
+    account's lock and a scan slot, so there it is raised at once as
+    `Throttled`: the caller records any Retry-After as a deadline for that
+    account and moves on, and the account is asked again at its next read."""
     refresh = oauth.get("refreshToken")
     if not refresh:
         raise CcrollError("no refresh token stored — re-login with `ccroll add`")
     body = {"grant_type": "refresh_token", "refresh_token": refresh, "client_id": CLIENT_ID}
     delay = REFRESH_BACKOFF_S
     for attempt in range(REFRESH_RETRIES):
-        status, data, neterr, _ = _http("POST", TOKEN_URL, None, body)
+        status, data, neterr, headers = _http("POST", TOKEN_URL, None, body)
         if neterr:
             raise CcrollError(f"token refresh network error: {neterr}")
         try:
@@ -490,11 +594,13 @@ def oauth_refresh(oauth: dict) -> dict:
             j = {}
         if status == 200 and j.get("access_token"):
             break
-        # throttling is transient: back off and try again before giving up
-        if status == 429 and attempt < REFRESH_RETRIES - 1:
-            time.sleep(delay)
-            delay *= 2
-            continue
+        if status == 429:
+            wait = retry_after_s(headers)
+            if UI_THREAD is None and attempt < REFRESH_RETRIES - 1:
+                time.sleep(wait if wait is not None else delay)
+                delay *= 2
+                continue
+            raise Throttled(f"token refresh throttled ({http_detail(status, data, j)})", wait)
         raise CcrollError(f"token refresh failed ({http_detail(status, data, j)})")
     new = dict(oauth)
     new["accessToken"] = j["access_token"]
@@ -507,21 +613,170 @@ def oauth_refresh(oauth: dict) -> dict:
     return new
 
 
-def fresh_token(cred_path: str, persist: bool = True) -> str:
+# --- credential locks -----------------------------------------------------------
+# Two layers, for two different races.  `account_lock` is in-process: one
+# thread at a time may read, refresh and file an account's tokens, so two of
+# this process's workers never spend the same refresh token (the second use
+# of a rotated one fails, or worse).  It is held across the refresh request,
+# which is why whoever holds it takes the urgent pacing queue.  `cred_lock`
+# is an flock between processes — `ccroll add` filing a new login while the
+# dashboard files a refresh — held only around read-compare-write, never
+# across a network call.  A UI thread only ever *tries* either (`try_hold`)
+# and leaves the work for the next tick when it cannot have them.
+_account_locks: dict = {}
+_account_locks_guard = threading.Lock()
+_flocks = threading.local()
+
+
+def _cred_dir(cred_path: str) -> str:
+    return os.path.realpath(os.path.dirname(cred_path) or ".")
+
+
+def account_lock(cred_path: str) -> "threading.RLock":
+    with _account_locks_guard:
+        return _account_locks.setdefault(_cred_dir(cred_path), threading.RLock())
+
+
+@contextlib.contextmanager
+def cred_lock(cred_path: str, blocking: bool = True):
+    """Serialise writers of one credentials file (flock on its directory, so
+    no lock file is left beside it).  Held only around read-compare-write,
+    never across a network call.  Re-entrant per thread.  Yields whether it
+    is held: with blocking=False, False when another holder has it."""
+    d = _cred_dir(cred_path)
+    held = _flocks.__dict__.setdefault("dirs", set())
+    if d in held:
+        yield True
+        return
+    if blocking:
+        off_ui("a wait for a credentials lock")
+    fd = os.open(d, os.O_RDONLY)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+        except BlockingIOError:
+            yield False
+            return
+        held.add(d)
+        try:
+            yield True
+        finally:
+            held.discard(d)
+    finally:
+        os.close(fd)
+
+
+@contextlib.contextmanager
+def try_hold(cred_paths):
+    """Both locks of every account in `cred_paths`, without waiting: yields
+    True with all of them held, or False (and holds none) when any is busy.
+    For the UI thread, which must never wait on a lock."""
+    with contextlib.ExitStack() as stack:
+        for path in sorted(set(cred_paths)):
+            lock = account_lock(path)
+            if not lock.acquire(blocking=False):
+                yield False
+                return
+            stack.callback(lock.release)
+            if not os.path.isdir(os.path.dirname(path) or "."):
+                continue                  # nothing on disk to protect yet
+            if not stack.enter_context(cred_lock(path, blocking=False)):
+                yield False
+                return
+        yield True
+
+
+def write_refreshed(cred_path: str, before: dict, creds: dict) -> bool:
+    """Write credentials refreshed from `before`, unless the file changed
+    while the refresh was in flight — a new login filed by `ccroll add`, or
+    tokens a client reported.  The newer file wins; returns whether it was
+    written."""
+    with cred_lock(cred_path):
+        seen = oauth_of(read_json(cred_path)) or {}
+        if seen.get("refreshToken") != before.get("refreshToken"):
+            return False
+        write_json_atomic(cred_path, creds)
+        return True
+
+
+# Refreshes between the request going out and the result being filed: a
+# dashboard quitting waits for these, since a refresh token the server has
+# rotated but nobody wrote down logs the account out.
+_refreshing = [0]
+_refreshing_guard = threading.Lock()
+
+
+@contextlib.contextmanager
+def refresh_in_flight():
+    with _refreshing_guard:
+        _refreshing[0] += 1
+    try:
+        yield
+    finally:
+        with _refreshing_guard:
+            _refreshing[0] -= 1
+
+
+def refreshes_in_flight() -> int:
+    return _refreshing[0]
+
+
+# A dashboard sets this to the store paths it must not refresh right now —
+# accounts a lane is live on or being swapped to, whose refresh token belongs
+# to a running Claude Code or to the swap under way.  Consulted under the
+# account's lock, so a swap claiming an account and a scan refreshing it
+# cannot interleave.
+REFRESH_BLOCKED: frozenset = frozenset()
+_refresh_hold: dict[str, float] = {}   # refresh token -> when a refresh 429's Retry-After ends
+
+
+def refresh_stored(cred_path: str, failed_access: str | None = None) -> str:
+    """Refresh the credentials at `cred_path` and file the result; returns
+    a currently valid access token.  Under the account's lock the file is
+    read again first: another thread may have refreshed it meanwhile, and
+    then its token is used instead — without `failed_access` (the expiry
+    path) when it is no longer close to expiry, with it (the token the
+    endpoint just rejected) when the file holds a different one."""
+    with account_lock(cred_path):
+        creds = read_json(cred_path)
+        oauth = oauth_of(creds)
+        if not oauth:
+            raise CcrollError(f"no credentials at {cred_path}")
+        left = expires_in_s(oauth)
+        if failed_access is None and left is not None and left > REFRESH_MARGIN_S:
+            return oauth["accessToken"]
+        if failed_access is not None and oauth["accessToken"] != failed_access:
+            return oauth["accessToken"]
+        if os.path.realpath(cred_path) in REFRESH_BLOCKED:
+            if failed_access is None and (left is None or left > 0):
+                return oauth["accessToken"]
+            raise CcrollError("access token expired — waiting for the holder's refresh")
+        until = _refresh_hold.get(oauth.get("refreshToken"), 0.0)
+        if now() < until:
+            raise CcrollError(f"token refresh throttled · server asked to wait {until - now():.0f}s")
+        with urgent_requests(), refresh_in_flight():
+            try:
+                new = oauth_refresh(oauth)
+            except Throttled as e:
+                if e.retry_after:
+                    _refresh_hold[oauth.get("refreshToken")] = now() + e.retry_after
+                raise
+            _refresh_hold.pop(oauth.get("refreshToken"), None)
+            creds["claudeAiOauth"] = new
+            write_refreshed(cred_path, oauth, creds)
+        return new["accessToken"]
+
+
+def fresh_token(cred_path: str) -> str:
     """Return a currently-valid access token for the credentials at cred_path,
     refreshing (and persisting the rotated refresh token) when needed."""
-    creds = read_json(cred_path)
-    oauth = oauth_of(creds)
+    oauth = oauth_of(read_json(cred_path))
     if not oauth:
         raise CcrollError(f"no credentials at {cred_path}")
     left = expires_in_s(oauth)
     if left is not None and left > REFRESH_MARGIN_S:
         return oauth["accessToken"]
-    new = oauth_refresh(oauth)
-    if persist:
-        creds["claudeAiOauth"] = new
-        write_json_atomic(cred_path, creds)
-    return new["accessToken"]
+    return refresh_stored(cred_path)
 
 
 # --- usage + profile ------------------------------------------------------------
@@ -551,10 +806,39 @@ class Usage:
         self.projected_from = None  # {session, weekly, scoped}: the raw reading, when projected
         self.projected_rate = None  # {key: %/h} the projection advanced each window by
         self.projected_age = None   # seconds between that reading and the projection
+        self.projected_full = None  # when the projection has a window full: the moment it
+                                    # filled, from which the account stops spending
         self.fetched_at = now()
 
     def windows(self):
         return {"session": self.session_pct, "weekly": self.weekly_pct, "scoped": self.scoped_pct}
+
+
+READING_FIELDS = ("session_pct", "session_reset", "weekly_pct", "weekly_reset",
+                  "scoped_pct", "scoped_reset", "scoped_label", "status", "fetched_at")
+
+
+def reading_blob(u: Usage) -> dict:
+    """A good reading as state.json keeps it: the figures, resets and when
+    it was taken — everything a restart needs to go on projecting it."""
+    return {f: getattr(u, f) for f in READING_FIELDS}
+
+
+def reading_of(blob) -> "Usage | None":
+    """A kept reading back as a Usage; None for anything malformed."""
+    if not isinstance(blob, dict) or not isinstance(blob.get("fetched_at"), (int, float)):
+        return None
+    u = Usage()
+    for f in READING_FIELDS:
+        v = blob.get(f)
+        if f in ("scoped_label", "status"):
+            v = v if isinstance(v, str) else None
+        elif not isinstance(v, (int, float)) or isinstance(v, bool):
+            v = None
+        setattr(u, f, v)
+    if u.session_pct is None and u.weekly_pct is None:
+        return None
+    return u
 
 
 def fetch_usage(token: str) -> Usage:
@@ -607,7 +891,16 @@ def fetch_usage(token: str) -> Usage:
     return u
 
 
-_usage_hold: dict[str, float] = {}   # cred_path -> when a Retry-After lets us ask again
+_usage_hold: dict[str, float] = {}   # hold key -> when a Retry-After lets us ask again
+
+
+def _hold_key(cred_path: str) -> str:
+    """Whose limiter a Retry-After is about: the credentials in the file,
+    not the file.  The live file is every account in turn — a hold on the
+    one just rotated away from must not blind the next one for its
+    remaining minutes."""
+    oauth = oauth_of(read_json(cred_path)) or {}
+    return oauth.get("refreshToken") or oauth.get("accessToken") or cred_path
 
 
 def _rate_limited(err: str | None) -> bool:
@@ -647,7 +940,8 @@ def usage_for(cred_path: str, refresh: bool = True) -> Usage:
     normal cadence — never faster, and that cadence is what the endpoint
     accepts at idle — unless the 429 carried a Retry-After, which is
     honoured to the second."""
-    until = _usage_hold.get(cred_path, 0.0)
+    key = _hold_key(cred_path)
+    until = _usage_hold.get(key, 0.0)
     if now() < until:
         u = Usage()
         u.error = f"rate_limit_error · server asked to wait {until - now():.0f}s"
@@ -661,17 +955,14 @@ def usage_for(cred_path: str, refresh: bool = True) -> Usage:
         u.error = "auth — waiting for the holder's refresh"
     elif u.error == "auth":
         try:
-            creds = read_json(cred_path)
-            new = oauth_refresh(oauth_of(creds) or {})
-            creds["claudeAiOauth"] = new
-            write_json_atomic(cred_path, creds)
-            u = fetch_usage(new["accessToken"])
+            u = fetch_usage(refresh_stored(cred_path, failed_access=token))
         except CcrollError as e:
             u = Usage(); u.error = str(e)
-    if u.retry_after:
-        _usage_hold[cred_path] = now() + u.retry_after
-    else:
-        _usage_hold.pop(cred_path, None)
+    for k in {key, _hold_key(cred_path)}:     # the same account, refreshed or not meanwhile
+        if u.retry_after:
+            _usage_hold[k] = now() + u.retry_after
+        else:
+            _usage_hold.pop(k, None)
     return u
 
 
@@ -718,6 +1009,8 @@ def load_state(cfg: Cfg) -> dict:
     state.setdefault("peak_hold", None)       # start of the peak range being held out
     state.setdefault("peak_released", None)   # start of the range [r] ended early
     state.setdefault("lanes", {})             # client host -> that lane's own keys
+    state.setdefault("readings", {})          # account -> its newest good reading
+    state.setdefault("lane_burn", None)       # this lane's burn before its last swap
     return state
 
 
@@ -755,14 +1048,15 @@ def event_host(state: dict, entry: list) -> str | None:
 # event log, the account names and the feed labels are the fleet's.  The
 # master's own lane keeps its keys at the top level of state.json, exactly
 # where a single-machine ccroll has always kept them.
-LANE_SHARED = frozenset(("samples", "events", "event_hosts", "emails", "signal_labels", "lanes"))
+LANE_SHARED = frozenset(("samples", "events", "event_hosts", "emails", "signal_labels", "lanes",
+                         "readings"))
 
 
 def new_lane_data() -> dict:
     return {"active": None, "active_since": 0, "last_swap": 0, "grace_until": 0,
             "touch_pending": False, "preload": [], "signal_crossed": [],
             "peak_hold": None, "peak_released": None, "pending": None,
-            "bare": False, "offline_since": None, "signal": True}
+            "bare": False, "offline_since": None, "signal": True, "lane_burn": None}
 
 
 class Lane:
@@ -937,29 +1231,52 @@ def store_identity(cfg: Cfg, email: str, ident: dict | None) -> str | None:
     return None
 
 
-def harvest(cfg: Cfg, state: dict) -> None:
-    """Copy the live credentials back into the active account's store dir.
-    Refresh tokens rotate, so the store must always hold the newest one."""
-    name = state.get("active")
+def harvest_into(cfg: Cfg, name: str | None) -> None:
+    """Copy the live credentials back into `name`'s store dir.  Refresh
+    tokens rotate, so the store must always hold the newest one.  Given the
+    name rather than the state: it runs on a worker, and the state is the
+    UI thread's."""
     live = read_json(cfg.live_path)
     if not name or not oauth_of(live):
         return
-    write_json_atomic(os.path.join(cfg.root, name, CRED_FILE), live)
+    path = os.path.join(cfg.root, name, CRED_FILE)
+    with cred_lock(path):
+        # a store written after the live file last changed is a newer login
+        # (`ccroll add` re-logging the live account in): the live copy is the
+        # stale one then, and must not be written back over it
+        with contextlib.suppress(OSError):
+            if os.stat(path).st_mtime > os.stat(cfg.live_path).st_mtime:
+                return
+        write_json_atomic(path, live)
 
 
 def prepare_creds(cfg: Cfg, target: Account) -> dict:
     """The target's stored credentials, refreshed first when they are about
     to expire.  Only ever called for an account no lane is on: its refresh
-    token is the store's to rotate."""
-    creds = target.read()
-    oauth = oauth_of(creds)
-    if not oauth:
-        raise CcrollError(f"account {target.name!r} has no credentials")
-    left = expires_in_s(oauth)
-    if left is None or left < REFRESH_MARGIN_S:
-        creds["claudeAiOauth"] = oauth_refresh(oauth)
-        write_json_atomic(target.cred_path, creds)
-    return creds
+    token is the store's to rotate (a dashboard has claimed it for the swap,
+    so its scan leaves the refresh to this).  Under the account's lock, so a
+    refresh another thread has under way is waited out and its result used."""
+    with account_lock(target.cred_path):
+        creds = target.read()
+        oauth = oauth_of(creds)
+        if not oauth:
+            raise CcrollError(f"account {target.name!r} has no credentials")
+        left = expires_in_s(oauth)
+        if left is None or left < REFRESH_MARGIN_S:
+            until = _refresh_hold.get(oauth.get("refreshToken"), 0.0)
+            if now() < until:
+                raise CcrollError(f"token refresh for {target.name} throttled · "
+                                  f"server asked to wait {until - now():.0f}s")
+            with urgent_requests(), refresh_in_flight():
+                try:
+                    creds["claudeAiOauth"] = oauth_refresh(oauth)
+                except Throttled as e:
+                    if e.retry_after:
+                        _refresh_hold[oauth.get("refreshToken")] = now() + e.retry_after
+                    raise
+                if not write_refreshed(target.cred_path, oauth, creds):
+                    return prepare_creds(cfg, target)    # a new login landed meanwhile: use it
+        return creds
 
 
 def commit_swap(cfg: Cfg, state: "dict | Lane", name: str, reason: str,
@@ -968,6 +1285,8 @@ def commit_swap(cfg: Cfg, state: "dict | Lane", name: str, reason: str,
     are: the bookkeeping every swap does wherever it was carried out, and the
     switch_done signal.  Returns the detail line ("left <prev>: <reason>")."""
     prev = state.get("active")
+    if prev and prev != name:
+        record_lane_burn(state, prev)
     state["active"] = name
     state["last_swap"] = now()
     state["active_since"] = state["last_swap"]
@@ -990,11 +1309,52 @@ def commit_swap(cfg: Cfg, state: "dict | Lane", name: str, reason: str,
     return detail
 
 
+def record_lane_burn(state: "dict | Lane", prev: str) -> None:
+    """Keep the burn the lane measured on the account it is leaving: until
+    the next account has a fit of its own (the grace, plus the samples a fit
+    needs) this is the rate its readings are projected at.  It is the same
+    lane — the same agents at the same fan-out — so its last measured rate
+    is the best estimate there is, and a reading that goes unanswered from
+    the first poll after the swap is then still projected rather than left
+    frozen.  Only windows with a fit of their own are recorded; the rest
+    keep the lane's earlier figure.  An account that was refusing requests
+    (a window full in its newest sample) records nothing: its flat line
+    measures the refusal, not the lane's demand.
+
+    The figure kept is the plain least-squares fit, not the burst-catching
+    rate `active_burn` acts on for the account itself: that one takes the
+    last two poll steps when they are steeper, which at whole-percent reads
+    is a quantisation step (1% a minute reads as 60%/h on an account doing
+    50%/h), and carried across a swap it would project every blackout that
+    much too fast."""
+    series = state.get("samples", {}).get(prev, {})
+    for key in ("session", "weekly"):
+        s = series.get(key) or []
+        if s and s[-1][1] >= FULL_PCT:
+            return
+    kept = dict(state.get("lane_burn") or {})
+    measured = False
+    for key in ("session", "weekly", "scoped"):
+        fit = burn_fit(burn_series(state, prev, key))
+        if fit is not None:
+            kept[key] = round(fit[0], 3)
+            measured = True
+    if measured:
+        kept.update(t=now(), account=prev)
+        state["lane_burn"] = kept
+
+
 def reassert_swap(cfg: Cfg, creds: dict, old: dict) -> bool:
     """Guard against the one narrow race: the running CLI finishing a token
     refresh of the OLD account and writing it back over our swap.  Returns
-    True when the swap had to be written again."""
+    True when the swap had to be written again.  Waits the re-check delay
+    itself: for a one-shot command.  A dashboard records the deadline and
+    calls `reassert_now` when it comes."""
     time.sleep(SWAP_VERIFY_DELAY_S)
+    return reassert_now(cfg, creds, old)
+
+
+def reassert_now(cfg: Cfg, creds: dict, old: dict) -> bool:
     new = oauth_of(creds) or {}
     seen = oauth_of(read_json(cfg.live_path)) or {}
     if seen.get("accessToken") != new.get("accessToken") and (
@@ -1007,28 +1367,22 @@ def reassert_swap(cfg: Cfg, creds: dict, old: dict) -> bool:
 
 
 def do_swap(cfg: Cfg, state: "dict | Lane", target: Account, reason: str,
-            snapshot: "Usage | None" = None, preemptive: bool = False, run=None) -> str:
-    """Swap the live credentials to `target`. Returns the human-readable detail
-    ("left <prev>: <reason>") so callers can show the same text in notices.
-    `snapshot` is the target's usage as last read: the preload is measured
-    against it at the end of the grace period.  `preemptive` marks a move made
-    while the previous account still had headroom; a natural (exhaustion or
-    manual) swap ends the current cycle and re-arms --touch.  `run(fn, *args)`
-    carries out the two slow steps — a token refresh and the re-check a
-    moment after the write — where the caller wants them (the master keeps
-    its links served meanwhile); they touch files, never `state`."""
-    run = run or (lambda fn, *args: fn(*args))
-    old = oauth_of(read_json(cfg.live_path)) or {}
-    harvest(cfg, state)
-    creds = run(prepare_creds, cfg, target)
-    write_json_atomic(cfg.live_path, creds)
+            snapshot: "Usage | None" = None, preemptive: bool = False) -> str:
+    """Swap the live credentials to `target`, start to finish on this thread:
+    for a one-shot command (a dashboard runs the same steps — `swap_live`,
+    `commit_swap`, `reassert_now` — without waiting on any of them).
+    Returns the human-readable detail ("left <prev>: <reason>") so callers
+    can show the same text in notices.  `snapshot` is the target's usage as
+    last read: the preload is measured against it at the end of the grace
+    period.  `preemptive` marks a move made while the previous account still
+    had headroom; a natural (exhaustion or manual) swap ends the current
+    cycle and re-arms --touch."""
+    creds, old, note = swap_live(cfg, state.get("active"), target)
     detail = commit_swap(cfg, state, target.name, reason, snapshot, preemptive)
-    if cfg.sync_identity:
-        note = swap_identity(cfg, target)
-        if note:
-            add_event(state, note)
+    if note:
+        add_event(state, note)
     save_state(cfg, state)
-    if run(reassert_swap, cfg, creds, old):
+    if reassert_swap(cfg, creds, old):
         add_event(state, "re-asserted swap over a concurrent write")
         if cfg.sync_identity:
             swap_identity(cfg, target)        # re-assert the identity too, quietly
@@ -1036,28 +1390,48 @@ def do_swap(cfg: Cfg, state: "dict | Lane", target: Account, reason: str,
     return detail
 
 
-def client_swap(cfg: Cfg, to: str, creds: dict, ident: dict | None) -> tuple[dict | None, str | None, bool]:
+def client_swap_write(cfg: Cfg, to: str, creds: dict, ident: dict | None) -> tuple[dict | None, str | None]:
     """A client carrying out the swap the master sent: the same live write
-    as `do_swap`, on this machine.  Returns (the credentials that were live —
-    the previous account's newest tokens, for the master's store —, the
-    identity note, whether the swap had to be re-asserted)."""
+    as `swap_live`, on this machine.  Returns (the credentials that were
+    live — the previous account's newest tokens, for the master's store —,
+    the identity note).  The re-check follows SWAP_VERIFY_DELAY_S later
+    (`client_swap_recheck`)."""
     if not oauth_of(creds):
         raise CcrollError(f"the master sent no usable credentials for {to}")
     old_creds = read_json(cfg.live_path)
-    old = oauth_of(old_creds) or {}
     write_json_atomic(cfg.live_path, creds)
     # From here the swap has happened: this machine is on `to`, whatever
     # else fails, and the result must say so — a failure reported now would
     # have the master hand `to` to another machine while this one is on it.
-    note, again = None, False
+    note = None
     try:
         note = patch_identity(cfg, to, ident) if cfg.sync_identity else None
-        again = reassert_swap(cfg, creds, old)
-        if again and cfg.sync_identity:
-            patch_identity(cfg, to, ident)
     except OSError as e:
         note = f"swapped, but a follow-up step failed: {e.strerror or e}"
-    return (old_creds if oauth_of(old_creds) else None), note, again
+    return old_creds, note
+
+
+def client_swap_step(cfg: Cfg, to: str, creds: dict, ident: dict | None,
+                     name_token: str | None) -> tuple[dict | None, str | None, str | None]:
+    """A client's swap for a worker: the write first, then — when the live
+    login it replaced was not one the client knew — naming that login by
+    its (still valid) token.  (credentials that were live, identity note,
+    the name found.)"""
+    old_creds, note = client_swap_write(cfg, to, creds, ident)
+    return old_creds, note, (fetch_email(name_token) if name_token else None)
+
+
+def client_swap_recheck(cfg: Cfg, to: str, creds: dict, old_creds: dict | None,
+                        ident: dict | None) -> tuple[str | None, bool]:
+    """The re-check half, SWAP_VERIFY_DELAY_S after the write: (a note when
+    a follow-up step failed, whether the swap had to be re-asserted)."""
+    try:
+        again = reassert_now(cfg, creds, oauth_of(old_creds) or {})
+        if again and cfg.sync_identity:
+            patch_identity(cfg, to, ident)
+        return None, again
+    except OSError as e:
+        return f"swapped, but a follow-up step failed: {e.strerror or e}", False
 
 
 def measure_preload(state: dict, usages: dict, cfg: Cfg) -> bool:
@@ -1393,11 +1767,58 @@ def signal_write(cfg: Cfg, state: dict, event: str, fields: dict,
     line = {"seq": seq, "ts": _utc(now()), "event": event}
     line.update(fields)
     events_path, _ = signal_paths(cfg)
-    with open(events_path, "a", encoding="utf-8") as fh:
-        fh.write(json.dumps(line, separators=(",", ":")) + "\n")
+    signal_io(event, _append_line, events_path, json.dumps(line, separators=(",", ":")) + "\n")
+    _signal_snapshot(cfg, state, snapshot or {}, seq=seq)
+
+
+def _append_line(path: str, text: str) -> None:
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(text)
         fh.flush()
         os.fsync(fh.fileno())            # a reader must never miss a written line
-    _signal_snapshot(cfg, state, snapshot or {}, seq=seq)
+
+
+class SignalWriter:
+    """The feed's file writes, off the UI thread: an fsync can take seconds
+    on a busy disk, and a dashboard must never stall its keys on one.  One
+    thread, one queue, so lines and snapshots land in exactly the order they
+    were made — the seq and the content are fixed when they are queued, on
+    the UI thread.  A failure is handed back (`errors`) to be logged the way
+    signal_guard logs one; `close` drains the queue before the dashboard
+    exits, since a reader must never miss a line that was written."""
+
+    def __init__(self):
+        self.q: queue.SimpleQueue = queue.SimpleQueue()
+        self.errors: queue.SimpleQueue = queue.SimpleQueue()
+        self.thread = threading.Thread(target=self._run, daemon=True, name="ccroll signal feed")
+        self.thread.start()
+
+    def _run(self) -> None:
+        while True:
+            item = self.q.get()
+            if item is None:
+                return
+            what, fn, args = item
+            try:
+                fn(*args)
+            except Exception as e:        # noqa: BLE001 — as signal_guard: logged, never fatal
+                self.errors.put((what, e))
+
+    def close(self) -> None:
+        self.q.put(None)
+        self.thread.join()
+
+
+SIGNAL_WRITER: "SignalWriter | None" = None
+
+
+def signal_io(what: str, fn, *args) -> None:
+    """Run a feed write now, or queue it for the writer thread when one is
+    running (a dashboard)."""
+    if SIGNAL_WRITER is not None:
+        SIGNAL_WRITER.q.put((what, fn, args))
+    else:
+        fn(*args)
 
 
 def _signal_mirror(state, updates: dict) -> dict:
@@ -1420,9 +1841,13 @@ def _signal_snapshot(cfg: Cfg, state: dict, updates: dict, seq: int | None = Non
             "account": snap.get("account"),
             "next_switch_eta_utc": snap.get("next_switch_eta_utc"),
             "window_resets_utc": snap.get("window_resets_utc")}
-    os.makedirs(cfg.signal_dir, mode=0o700, exist_ok=True)
     _, state_path = signal_paths(cfg)
-    write_json_atomic(state_path, blob)
+    signal_io("snapshot", _write_snapshot, cfg.signal_dir, state_path, blob)
+
+
+def _write_snapshot(signal_dir: str, path: str, blob: dict) -> None:
+    os.makedirs(signal_dir, mode=0o700, exist_ok=True)
+    write_json_atomic(path, blob)
 
 
 @contextlib.contextmanager
@@ -1721,39 +2146,108 @@ def projected_usage(state: dict, name: str, u: Usage, t: float | None = None) ->
     threshold, however long the blackout — which is how privacy@ was held at
     "91%" for eleven minutes while it burned through to 100%.  So each window
     is advanced by rate × age, using the same conservative rate the burn
-    rules act on, and capped at 100.  The age is unbounded: the rate is the
-    one measured before the blackout (the fit is anchored on the newest
-    sample, which a failed read does not add), and a window keeps rising at
-    it until its reset.  Windows without a burn estimate, or whose reset has
-    passed by `t`, are left as read — the first stays at its lower bound,
-    the second is judged as rolled over (0%) by `effective_pct`, never as
-    the stale figure plus a projection; nothing is projected during the
-    post-swap grace, when no rate exists.  The copy records the raw reading,
-    the rate and the age so a reason or a dashboard line can show its
-    working."""
+    rules act on (`active_burn`: the account's own fit, or until it has one
+    the burn its lane measured before the swap), and capped at 100.  The age
+    is unbounded: the rate is the one measured before the blackout (the fit
+    is anchored on the newest sample, which a failed read does not add), and
+    a window keeps rising at it until its reset.  Windows without a burn
+    estimate, or whose reset has passed by `t`, are left as read — the first
+    stays at its lower bound, the second is judged as rolled over (0%) by
+    `effective_pct`, never as the stale figure plus a projection.
+
+    A spent account stops spending.  Once the session or the all-models
+    weekly window projects full, the account refuses every request, so no
+    window rises further until that window resets — the weekly figures of an
+    account whose session filled an hour into a blackout stop there, rather
+    than climbing on at a burn nothing is paying.  After such a reset the
+    account burns again at the same rate, until a window fills again.
+
+    A reading taken before the swap onto the account (the target's fresh
+    read, standing in until the first poll answers) has not seen the swap's
+    own cost, so once the grace is over — by when the preload has been paid
+    — the measured preload is added to it.  Not before: adding it the
+    moment the swap lands would judge a new account by a cost it has not
+    incurred yet, and move on before the agents had re-primed on it.
+
+    The copy records the raw reading, the rate and the age so a reason or a
+    dashboard line can show its working."""
     t = now() if t is None else t
     age = max(0.0, t - u.fetched_at)
     out = copy.copy(u)
-    if u.error or not name or name == LIVE_PSEUDO or in_grace(state, t):
+    if u.error or not name or name == LIVE_PSEUDO:
         return out
-    raw, rates, moved = {}, {}, False
-    for key, pct, reset in (("session", u.session_pct, u.session_reset),
-                            ("weekly", u.weekly_pct, u.weekly_reset),
-                            ("scoped", u.scoped_pct, u.scoped_reset)):
-        raw[key] = pct
-        if pct is None or window_rolled(reset, t):
+    f = u.fetched_at
+    wins = {}                             # key -> [level, reset, rate]
+    for key in ("session", "weekly", "scoped"):
+        pct, reset = getattr(u, f"{key}_pct"), getattr(u, f"{key}_reset")
+        if pct is None:
             continue
         rate = active_burn(state, name, key)
-        if rate is None or rate < BURN_MIN_RATE:
+        wins[key] = [0.0 if window_rolled(reset, f) else float(pct),
+                     reset if reset and reset > f else None,
+                     rate if rate is not None and rate >= BURN_MIN_RATE else None]
+    swapped = state.get("last_swap") or 0
+    pre = (preload_estimate(state) or {}) if (name == state.get("active") and f < swapped
+                                              and not in_grace(state, t)) else {}
+    for key, w in wins.items():
+        if pre.get(key) and not window_rolled(w[1], swapped):
+            w[0] = min(100.0, w[0] + pre[key])
+    full_since = _advance_windows(wins, f, t)
+    raw, rates, moved = {}, {}, False
+    for key, w in wins.items():
+        pct = getattr(u, f"{key}_pct")
+        raw[key] = pct
+        if window_rolled(getattr(u, f"{key}_reset"), t):
             continue
-        rates[key] = rate
-        setattr(out, f"{key}_pct", min(100.0, pct + rate * age / 3600.0))
-        moved = True
+        if w[2] is not None:
+            rates[key] = w[2]
+        if w[0] != pct:
+            setattr(out, f"{key}_pct", w[0])
+            moved = True
     if moved:
         out.projected_from = raw
         out.projected_rate = rates
         out.projected_age = age
+        out.projected_full = full_since
     return out
+
+
+ACCOUNT_WIDE = ("session", "weekly")      # windows that, full, refuse every request
+
+
+def _advance_windows(wins: dict, t0: float, t1: float) -> float | None:
+    """Advance each window's [level, reset, rate] from t0 to t1, in place,
+    event by event: a window filling, a window resetting.  While any
+    account-wide window is full nothing rises; a window that resets starts
+    again from 0 with its next reset unknown.  Returns the moment the
+    account last became refused, when it still is at t1."""
+    def refused() -> bool:
+        return any(wins[k][0] >= 100.0 for k in ACCOUNT_WIDE if k in wins)
+
+    c = t0
+    since = t0 if refused() else None
+    while c < t1:
+        blocked = refused()
+        events = [(t1, None)] + [(w[1], ("reset", k)) for k, w in wins.items() if w[1] and w[1] > c]
+        if not blocked:
+            events += [(c + (100.0 - w[0]) / w[2] * 3600, ("full", k))
+                       for k, w in wins.items() if w[2] is not None and w[0] < 100.0]
+        nxt, what = min(events, key=lambda e: e[0])
+        if not blocked:
+            for w in wins.values():
+                if w[2] is not None:
+                    w[0] = min(100.0, w[0] + w[2] * (nxt - c) / 3600)
+        c = nxt
+        if what and what[0] == "full":
+            wins[what[1]][0] = 100.0          # exact, whatever the rounding
+        for k, w in wins.items():
+            if w[1] and w[1] <= c:
+                w[0], w[1] = 0.0, None
+        if not refused():
+            since = None
+        elif since is None:
+            since = c
+    return since
 
 
 def active_burn(state: dict, name: str, key: str) -> float | None:
@@ -1762,13 +2256,15 @@ def active_burn(state: dict, name: str, key: str) -> float | None:
     so a burst that just started is caught even though the 45-minute fit
     lags.  "Sustained" means the smaller of the last two step slopes: a
     single jump between two polls (the re-prime after a swap) does not count
-    until the next poll confirms it.  None until there is a fit at all;
-    the series restarts at every swap and the post-swap grace is skipped,
-    so a fit exists about 2 minutes after the grace ends."""
+    until the next poll confirms it.  The series restarts at every swap and
+    the post-swap grace is skipped, so the account's own fit exists about 2
+    minutes after the grace ends; until then the active account burns at
+    the rate its lane measured before the swap (`record_lane_burn`), and
+    None only when there is neither."""
     series = burn_series(state, name, key)
     fit = burn_fit(series)
     if fit is None:
-        return None
+        return lane_burn(state, key) if name and name == state.get("active") else None
     rate = fit[0]
     if len(series) >= 3:
         steps = []
@@ -1778,6 +2274,12 @@ def active_burn(state: dict, name: str, key: str) -> float | None:
         if len(steps) == 2:
             rate = max(rate, min(steps))
     return rate
+
+
+def lane_burn(state: dict, key: str) -> float | None:
+    """The burn this lane measured on its previous account, for `key`."""
+    rate = (state.get("lane_burn") or {}).get(key)
+    return float(rate) if isinstance(rate, (int, float)) and not isinstance(rate, bool) else None
 
 
 def window_eta(state: dict, name: str, key: str, pct: float | None):
@@ -1790,9 +2292,11 @@ def window_eta(state: dict, name: str, key: str, pct: float | None):
     shown is always what is acted on."""
     series = burn_series(state, name, key)
     fit = burn_fit(series)
-    if fit is None:
-        return None, None, None, False
     rate = active_burn(state, name, key)
+    if fit is None:
+        # the lane's pre-swap burn standing in: acted on, and shown dimmed
+        return (rate, None, eta_to_limit(pct, rate), True) if rate is not None \
+            else (None, None, None, False)
     return rate, fit[0], eta_to_limit(pct, rate), fit[1] < BURN_SETTLED_SPAN_S
 
 
@@ -2323,6 +2827,8 @@ def render_burn(a: Ansi, state: dict, name: str, u: Usage | None, scoped_label: 
         note = ""
         if rolled:
             note = a.dim("↺ rolled over — 0% inferred, awaiting a fresh read")
+        elif rate is not None and fit_rate is None:
+            note = a.dim("(this host's burn before the swap, until a fit of its own)")
         elif rate is not None and fit_rate is not None and rate > max(fit_rate, BURN_MIN_RATE) * 1.2:
             note = a.dim(f"(fit {fit_rate:.1f}%/h)")
         tail = "  ".join(x for x in (verdict, note) if x)
@@ -2338,6 +2844,8 @@ def render_burn(a: Ansi, state: dict, name: str, u: Usage | None, scoped_label: 
                 continue
             bits.append(f"{label} {raw:.0f}% read, ≈{cur:.0f}% projected at {rate:.0f}%/h")
         if bits:
+            if u.projected_full is not None:
+                bits.append(f"refused since ≈{fmt_clock(u.projected_full)[:5]}, so no longer rising")
             lines.append(a.yellow(f"  reading is {fmt_dur(u.projected_age)} old — "
                                   + " · ".join(bits)))
     if in_grace(state):
@@ -2431,29 +2939,43 @@ def render_runway(a: Ansi, rw: dict, fc: dict, scoped_label: str) -> str:
 
 # --- scanning -------------------------------------------------------------------
 def scan_accounts(cfg: Cfg, accounts: list[Account], active: str | None,
-                  held: "set | dict | None" = None) -> dict:
-    """Fetch usage for every account in parallel.  The active account is read
-    through the LIVE credentials file, which the running CLI keeps freshest.
+                  held: "set | dict | None" = None, on_result=None) -> dict:
+    """Fetch usage for every account.  The active account is read through
+    the LIVE credentials file, which the running CLI keeps freshest.
     Accounts in `held` are live on a client machine: read with the token it
-    last reported, never refreshed here."""
+    last reported, never refreshed here.
+
+    Every account has its own worker and every request its pacing slot
+    (PACER), so the fleet reaches the endpoints one request a second however
+    many accounts there are, and an account that is slow to answer holds up
+    nobody else's read.  `on_result(name, usage)` is called as each account
+    lands, in the order they land, so a dashboard can show them one by one."""
     held = held or ()
-    # A fleet-wide scan can need a token refresh for every account at once.
-    # Firing those simultaneously trips the endpoint's rate limiter, so each
-    # worker waits out a slot before starting.
-    def one(item: tuple[int, Account]) -> tuple[str, Usage]:
-        idx, acc = item
-        if idx:
-            time.sleep(REFRESH_STAGGER_S * idx)
-        if acc.name == active:
-            return acc.name, usage_for(cfg.live_path)
-        return acc.name, usage_for(acc.cred_path, refresh=acc.name not in held)
+
+    def one(acc: Account) -> tuple[str, Usage]:
+        try:
+            if acc.name == active:
+                return acc.name, usage_for(cfg.live_path)
+            return acc.name, usage_for(acc.cred_path, refresh=acc.name not in held)
+        except Exception as e:            # noqa: BLE001 — one account's surprise is its own
+            u = Usage()
+            u.error = f"read failed: {e}"
+            return acc.name, u
 
     results: dict[str, Usage] = {}
-    if not accounts:
-        return results
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(MAX_PARALLEL, len(accounts))) as ex:
-        for name, usage in ex.map(one, enumerate(accounts)):
-            results[name] = usage
+    # Plain daemon threads rather than an executor: an executor's workers
+    # are joined when the interpreter exits, so a dashboard asked to quit
+    # would first sit out the rest of the scan (and any account that takes
+    # its time to answer).  The queue hands results over as they complete.
+    landed: queue.SimpleQueue = queue.SimpleQueue()
+    for acc in accounts:
+        threading.Thread(target=lambda acc=acc: landed.put(one(acc)), daemon=True,
+                         name=f"ccroll scan {acc.name}").start()
+    for _ in accounts:
+        name, usage = landed.get()
+        results[name] = usage
+        if on_result is not None:
+            on_result(name, usage)
     return results
 
 
@@ -2565,8 +3087,10 @@ class LiveMonitor:
         self.mtime = self._stat()
         self.expected_access = (oauth_of(read_json(self.cfg.live_path)) or {}).get("accessToken")
 
-    def check(self) -> str | None:
-        """Returns an event message when something noteworthy happened."""
+    def changed(self) -> dict | None:
+        """The live credentials, when they changed to a token this monitor
+        did not write and so must be named; None otherwise.  Only a stat and
+        a small read: fit for the UI thread."""
         m = self._stat()
         if m == self.mtime:
             return None
@@ -2575,12 +3099,15 @@ class LiveMonitor:
         if not oauth or oauth.get("accessToken") == self.expected_access:
             return None
         self.expected_access = oauth.get("accessToken")
+        return oauth
+
+    def apply(self, oauth: dict, email: str | None) -> str | None:
+        """What the login `changed` found turned out to be (`identify_live`
+        named it, and harvested it if it was the active account's refresh)."""
         state, cfg = self.state, self.cfg
-        email = fetch_email(oauth["accessToken"])
         active = state.get("active")
         if email and active and email == state["emails"].get(active):
-            harvest(cfg, state)   # the CLI refreshed its token: keep the store current
-            return None
+            return None                   # the CLI refreshed its token; harvested already
         if email:
             existing = {acc.name for acc in list_accounts(cfg)}
             for name, known in state["emails"].items():
@@ -2594,6 +3121,22 @@ class LiveMonitor:
         add_event(state, "unknown login in live config — rotation paused (run `ccroll adopt`)")
         save_state(cfg, state)
         return "unknown login — rotation paused"
+
+
+def identify_live(cfg: Cfg, token: str, active: str | None,
+                  active_email: str | None) -> tuple[str | None, str | None]:
+    """Name a live login by its profile (a request: a worker's job), and when
+    it is the active account's own — the CLI refreshed its token — file the
+    new tokens into the store straight away, so the refresh token the CLI
+    just rotated is never lost.  Returns (email, a note when filing failed)."""
+    email = fetch_email(token)
+    note = None
+    if email and active and email == active_email:
+        try:
+            harvest_into(cfg, active)
+        except OSError as e:
+            note = f"could not file the refreshed live tokens: {e.strerror or e}"
+    return email, note
 
 
 # --- keyboard -------------------------------------------------------------------
@@ -2646,11 +3189,26 @@ def cmd_status(cfg: Cfg, a: Ansi) -> int:
     state = load_state(cfg)
     accounts = list_accounts(cfg)
     held = client_holdings(state)
-    usages = scan_accounts(cfg, accounts, state.get("active"), held)
+    done = [0]
+
+    def show(name, u):
+        done[0] += 1
+        sys.stderr.write(f"\rreading {len(accounts)} accounts · {done[0]} read ")
+        sys.stderr.flush()
+    # one read a second (the pacer): on a terminal, say how far along it is
+    progress = show if sys.stderr.isatty() and accounts else None
+    usages = scan_accounts(cfg, accounts, state.get("active"), held, on_result=progress)
+    if progress is not None:
+        sys.stderr.write("\r\033[K")
     if state.get("active") is None and oauth_of(read_json(cfg.live_path)):
         usages[LIVE_PSEUDO] = usage_for(cfg.live_path)
     record_samples(state, usages)
-    save_state(cfg, state)
+    if not master_running(cfg):
+        # a running master owns state.json and rewrites it from memory; what
+        # this scan would add is folded into a fresh read of the file instead
+        latest = load_state(cfg)
+        record_samples(latest, usages)
+        save_state(cfg, latest)
     label = scoped_label_of(usages)
     print(a.bold(f"ccroll {CCROLL_VERSION} · {len(accounts)} account(s) · {datetime.now().strftime('%Y-%m-%d %H:%M %Z')}"))
     print()
@@ -2701,6 +3259,14 @@ def client_holdings(state: dict) -> dict:
 # --- master socket --------------------------------------------------------------
 def master_sock_path(cfg: Cfg) -> str:
     return os.path.join(cfg.root, ".ccroll", MASTER_SOCK)
+
+
+def master_running(cfg: Cfg) -> bool:
+    try:
+        unix_connect(master_sock_path(cfg)).close()
+    except OSError:
+        return False
+    return True
 
 
 def _sock_addr(path: str) -> tuple[str, int | None]:
@@ -2802,7 +3368,7 @@ class Server:
     keyboard and every connection, so a key or a message is handled the
     moment it arrives and neither waits on the other."""
 
-    def __init__(self, cfg: Cfg):
+    def __init__(self, cfg: Cfg, wake_r: int):
         self.path = master_sock_path(cfg)
         os.makedirs(os.path.dirname(self.path), mode=0o700, exist_ok=True)
         if os.path.exists(self.path):
@@ -2826,14 +3392,7 @@ class Server:
         self.sock.listen()
         self.sock.setblocking(False)
         self.conns: list[Conn] = []
-        # a worker thread finishing a network read ends the wait at once
-        self.wake_r, self.wake_w = os.pipe()
-        os.set_blocking(self.wake_r, False)
-        os.set_blocking(self.wake_w, False)
-
-    def wake(self) -> None:
-        with contextlib.suppress(OSError):
-            os.write(self.wake_w, b"x")
+        self.wake_r = wake_r              # a worker finishing ends the wait at once
 
     def close(self) -> None:
         for c in list(self.conns):
@@ -2841,9 +3400,6 @@ class Server:
             with contextlib.suppress(OSError):
                 c.sock.close()
         self.sock.close()
-        for fd in (self.wake_r, self.wake_w):
-            with contextlib.suppress(OSError):
-                os.close(fd)
         with contextlib.suppress(OSError):
             os.unlink(self.path)
 
@@ -2922,6 +3478,8 @@ class LaneRt:
         self.next_poll = 0.0
         self.conn: Conn | None = None
         self.pending_snapshot: Usage | None = None
+        self.want_rotate: str | None = None   # an [r] that came while the lane was busy
+        self.key = f"lane:{ls.host}"          # its one slot for work in flight
 
     @property
     def host(self) -> str:
@@ -2929,6 +3487,42 @@ class LaneRt:
 
     def online(self) -> bool:
         return self.local or self.conn is not None
+
+
+def swap_live(cfg: Cfg, prev: str | None, target: Account) -> tuple[dict, dict, str | None]:
+    """The file work of a swap on this machine, for a worker: harvest the
+    account being left, prepare the target (a refresh, when its token is
+    about to expire), write the live file, point the displayed identity at
+    it when asked to.  Returns (the credentials written, the live oauth
+    they replaced, an identity note for the log).  Nothing here touches
+    the state: the caller commits the swap once this is done."""
+    old = oauth_of(read_json(cfg.live_path)) or {}
+    harvest_into(cfg, prev)
+    creds = prepare_creds(cfg, target)
+    write_json_atomic(cfg.live_path, creds)
+    # from here the swap has happened, whatever else fails
+    note = None
+    if cfg.sync_identity:
+        try:
+            note = swap_identity(cfg, target)
+        except OSError as e:
+            note = f"identity left as-is: {e.strerror or e}"
+    return creds, old, note
+
+
+def reassert_live(cfg: Cfg, creds: dict, old: dict, target: str) -> bool:
+    """`reassert_now` for a worker, identity included."""
+    again = reassert_now(cfg, creds, old)
+    if again and cfg.sync_identity:
+        with contextlib.suppress(OSError, CcrollError):
+            swap_identity(cfg, get_account(cfg, target))
+    return again
+
+
+def _verify_in(fn, cfg: Cfg, pool: dict, *args):
+    """verified_target / verified_parking on a worker: (its choice, the pool
+    with the fresh reads it made)."""
+    return fn(cfg, pool, *args), pool
 
 
 class Master:
@@ -2942,7 +3536,16 @@ class Master:
     The store is the master's alone.  A client's account is read with the
     token the client last reported and never refreshed here — its Claude
     Code refreshes it, and reports the rotated tokens back — so a refresh
-    token only ever has one owner."""
+    token only ever has one owner.
+
+    One thread reads the keys, serves the links, draws, decides and owns
+    the state; it never waits on anything slow.  Every request, pacing
+    slot, lock wait and swap step runs on a worker (`submit`), and its
+    result comes back through a queue and is applied here, so the state
+    only ever changes on this thread and a key is handled within one tick
+    whatever is in flight.  Each lane has one slot for work — its poll, the
+    fresh reads before a swap, the swap — so a lane's own steps never
+    overlap, while the fleet scan, other lanes and the keys carry on."""
 
     def __init__(self, cfg: Cfg, a: Ansi):
         self.cfg, self.a = cfg, a
@@ -2950,6 +3553,7 @@ class Master:
         self.accounts = list_accounts(cfg)
         self.usages: dict[str, Usage] = {}
         self.last_good: dict[str, Usage] = {}   # newest error-free read per account
+        self.seed_view: dict[str, Usage] = {}   # last run's samples, shown until a read lands
         self.next_scan = 0.0
         self.paused = not cfg.rotate
         self.host = socket.gethostname()
@@ -2962,62 +3566,148 @@ class Master:
         self.monitor = LiveMonitor(cfg, self.local.ls)
         self.server: Server | None = None
         self.kb: "Keyboard | None" = None
-        self.busy: str | None = None      # the network read under way, while one is
-        self.backlog: list = []           # messages that arrived while it was
-        self.keys: list = []              # keys pressed while it was
+        self.backlog: list = []           # messages waiting on an account's lock
         self.printed = None
         self.tty_out = False
+        # work in flight: key -> what it is (shown in the header); results
+        # come back on `done`, and the pipe wakes the loop when one does
+        self.tasks: dict[str, str] = {}
+        self.done: queue.SimpleQueue = queue.SimpleQueue()
+        self.wake_r, self.wake_w = os.pipe()
+        os.set_blocking(self.wake_r, False)
+        os.set_blocking(self.wake_w, False)
+        self.scan_prog: list | None = None    # [accounts, read so far] while a scan runs
+        self.claims: dict[str, str] = {}      # account -> host a swap to it is under way for
+        self.timers: list = []                # [(when, fn)] — waits, as deadlines
+        self.reassert: tuple | None = None    # the re-check a local swap is owed
+        self.quitting = False
+        self.seed()
 
-    # --- slow work, with the links kept served ------------------------------
-    def background(self, what: str, fn, *args):
-        """fn(*args) — a network read or a swap's slow step — on a worker
-        thread, while this thread keeps every link served: buffers flushed,
-        heartbeats taken, the dashboard and each client's view redrawn with
-        `what` on them.  Anything that could change who holds what (a hello,
-        a swap result, a rotate request, a key) waits in the backlog until
-        the work is done: the worker reads and refreshes accounts no lane is
-        on, and that must stay true until it is finished.  State is only
-        ever changed on this thread."""
-        if self.server is None or self.busy is not None:
-            return fn(*args)
-        box: dict = {}
-        server = self.server
+    def seed(self) -> None:
+        """Start from what the last run knew.  Every account's newest good
+        reading is kept in state.json (`remember_good`); it stands in, marked
+        with its age, until this run's scan reaches the account — so the
+        table is filled from the first frame and the pool is whole from the
+        first decision (a swap still confirms its target with a fresh read).
+        For a lane's live account it is also what rotation projects from
+        when the first reads fail: a restart in the middle of a blackout
+        goes on projecting the reading the blackout began with, instead of
+        having nothing to project.  An account with only burn samples kept
+        (a state.json from before readings were) shows its newest samples,
+        for display only: without reset times they cannot be judged."""
+        names = {acc.name for acc in self.accounts}
+        readings = self.state.get("readings") or {}
+        for name in sorted(names):
+            u = reading_of(readings.get(name))
+            if u is not None:
+                self.last_good[name] = u
+                shown = copy.copy(u)
+                shown.stale_note = "from last run"
+                self.usages[name] = shown
+                continue
+            series = self.state.get("samples", {}).get(name) or {}
+            u, newest = Usage(), None
+            for key in ("session", "weekly", "scoped"):
+                pts = series.get(key) or []
+                if pts:
+                    setattr(u, f"{key}_pct", pts[-1][1])
+                    newest = max(newest or 0.0, pts[-1][0])
+            if newest is not None and u.session_pct is not None:
+                u.fetched_at, u.stale_note = newest, "from last run"
+                self.seed_view[name] = u
+
+    # --- work off this thread ------------------------------------------------
+    def wake(self) -> None:
+        with contextlib.suppress(OSError):
+            os.write(self.wake_w, b"x")
+
+    def submit(self, key: str, what: str, fn, *args, then=None, urgent: bool = False) -> bool:
+        """fn(*args) on a worker thread; then(value, error) back on this
+        thread once it is done.  `key` is the slot it occupies — a lane's,
+        "scan", … — and nothing else starts in that slot meanwhile (False:
+        it is taken).  `urgent` puts its requests ahead of the scan's."""
+        if key in self.tasks:
+            return False
+        self.tasks[key] = what
 
         def work():
+            v = e = None
             try:
-                box["v"] = fn(*args)
-            except BaseException as e:    # handed back to the caller's thread
-                box["e"] = e
-            finally:
-                server.wake()
+                if urgent:
+                    with urgent_requests():
+                        v = fn(*args)
+                else:
+                    v = fn(*args)
+            except BaseException as ex:   # handed back to this thread
+                e = ex
+            self.done.put((key, then, v, e))
+            self.wake()
 
-        worker = threading.Thread(target=work, daemon=True)
-        self.busy = what
-        worker.start()
-        try:
-            while worker.is_alive():
-                self.service_light()
-            worker.join()
-        finally:
-            self.busy = None
-        if "e" in box:
-            raise box["e"]
-        return box.get("v")
+        threading.Thread(target=work, daemon=True, name=f"ccroll {key}").start()
+        return True
 
-    def service_light(self) -> None:
-        self.draw()
-        self.push_views()
-        key, msgs = self.server.wait(1.0, self.kb)
-        if key:
-            self.keys.append(key)
-        for c, msg in msgs:
-            lr = c.lane
-            if msg is not None and msg.get("type") == "beat" and msg.get("v") == PROTO_V \
-                    and lr is not None and lr.conn is c:
-                c.heard = now()
-                self.take_beat(c, msg)
-            else:
-                self.backlog.append((c, msg))
+    def post(self, fn, *args) -> None:
+        """From a worker: fn(*args) on this thread, at its next turn."""
+        self.done.put((None, lambda v, e: fn(*args), None, None))
+        self.wake()
+
+    def drain(self) -> None:
+        while True:
+            try:
+                key, then, v, e = self.done.get_nowait()
+            except queue.Empty:
+                return
+            if key is not None:
+                self.tasks.pop(key, None)
+            if then is not None:
+                then(v, e)
+            elif e is not None:
+                raise e
+
+    def at(self, when: float, fn) -> None:
+        """fn() on this thread once `when` has come: how a wait is done here."""
+        self.timers.append((when, fn))
+
+    def run_timers(self) -> None:
+        due = [x for x in self.timers if x[0] <= now()]
+        self.timers = [x for x in self.timers if x[0] > now()]
+        for _, fn in sorted(due, key=lambda x: x[0]):
+            fn()
+
+    def busy(self, lr: LaneRt) -> bool:
+        return lr.key in self.tasks
+
+    def live_unsettled(self) -> bool:
+        """This machine's live file is being named or re-checked: a decision
+        about its lane waits for the answer."""
+        return "live-id" in self.tasks or self.reassert is not None
+
+    def lane_free(self, lr: LaneRt) -> bool:
+        return not self.busy(lr) and not (lr.local and self.live_unsettled())
+
+    def guard(self) -> None:
+        """Tell the workers which store accounts they must not refresh: those
+        a lane is live on or being swapped to, and those a swap has claimed.
+        Set before a swap's work starts and whenever a link changes who
+        holds what (under that account's lock), so a scan's refresh and a
+        swap can never interleave on one refresh token."""
+        global REFRESH_BLOCKED
+        names = set(self.holdings()) | set(self.claims)
+        REFRESH_BLOCKED = frozenset(os.path.realpath(os.path.join(self.cfg.root, n, CRED_FILE))
+                                    for n in names)
+
+    def log_trouble(self) -> None:
+        """Feed writes that failed on the writer thread, and anything slow
+        that ran on this thread, into the log."""
+        if SIGNAL_WRITER is not None:
+            while True:
+                try:
+                    what, e = SIGNAL_WRITER.errors.get_nowait()
+                except queue.Empty:
+                    break
+                add_event(self.state, f"signal {what} failed: {e}")
+        while UI_STALLS:
+            add_event(self.state, f"internal: {UI_STALLS.pop(0)} ran on the dashboard's thread")
 
     # --- lanes ---------------------------------------------------------------
     def lanes(self) -> list:
@@ -3053,10 +3743,26 @@ class Master:
         return {n: u for n, u in self.usages.items() if n not in others}
 
     def adopt_reads(self, pool: dict) -> None:
-        """Fresh reads a rotation made against a pool keep the dashboard honest."""
+        """Fresh reads a rotation made against a pool keep the dashboard
+        honest — each only where it is newer than what has landed since."""
         for n, u in pool.items():
-            if n in self.usages:
+            cur = self.usages.get(n)
+            if n in self.usages and u is not None and u is not cur and not u.error \
+                    and (cur is None or u.fetched_at > cur.fetched_at):
                 self.usages[n] = u
+                self.remember_good({n: u})
+
+    def taken(self, lr: LaneRt) -> set:
+        """Accounts out of this lane's reach right now: another lane is on
+        one or being swapped to it, or a swap has claimed it."""
+        return set(self.holdings(lr)) | set(self.claims)
+
+    def still(self, lr: LaneRt, active: str | None, auto: bool) -> bool:
+        """Is a decision made for this lane on `active` still the lane's to
+        act on, now that its fresh reads are in?"""
+        ls = lr.ls
+        return (ls.get("active") == active and not ls.get("pending") and lr.online()
+                and not (auto and self.paused))
 
     def displaced_by(self, lr: LaneRt) -> str | None:
         """Another host live on this lane's account, when this lane is the
@@ -3084,81 +3790,125 @@ class Master:
         if not oauth or name not in {acc.name for acc in list_accounts(self.cfg)}:
             return False
         path = os.path.join(self.cfg.root, name, CRED_FILE)
-        if oauth_of(read_json(path)) != oauth:
-            write_json_atomic(path, creds)
+        with cred_lock(path):              # held already: taken by `take_messages`
+            if oauth_of(read_json(path)) != oauth:
+                write_json_atomic(path, creds)
         return True
 
     # --- reading usage -------------------------------------------------------
     def remember_good(self, fresh: dict) -> None:
+        """Keep each account's newest good reading — in memory for the
+        blackout rules, and in state.json for the next run (`seed`)."""
         for name, u in fresh.items():
             if u is not None and not u.error and u.session_pct is not None:
                 self.last_good[name] = u
+                if name != LIVE_PSEUDO:
+                    self.state["readings"][name] = reading_blob(u)
+
+    def remember_swap_read(self, target: str, snapshot: "Usage | None") -> None:
+        """At a swap, the target's fresh read becomes its last good reading
+        and its current one: a reading exists from the swap moment on, and
+        if every poll after the swap fails, that is what rotation projects
+        (at the lane's burn until the account has a fit of its own)."""
+        if snapshot is None or snapshot.error or snapshot.session_pct is None:
+            return
+        cur = self.last_good.get(target)
+        if cur is None or snapshot.fetched_at >= cur.fetched_at:
+            self.remember_good({target: snapshot})
+        u = self.usages.get(target)
+        if u is None or u.error or u.fetched_at < snapshot.fetched_at:
+            self.usages[target] = snapshot
+
+    def live_names(self) -> set:
+        """Accounts a lane is live on: each is read by its lane's own poll."""
+        return {lr.ls.get("active") for lr in self.lanes() if lr.ls.get("active")}
 
     def rescan(self) -> None:
+        """The fleet scan, on workers: each account shows on the dashboard
+        the moment its read lands.  Lanes' live accounts are left to their
+        lanes' polls, which read them the way the lane is on them, a minute
+        apart; what the scan brings is every other account."""
+        if "scan" in self.tasks:
+            return
         cfg = self.cfg
         self.accounts[:] = list_accounts(cfg)
-        active = self.local.ls.get("active")
-        held = self.holdings(self.local)
+        names = {acc.name for acc in self.accounts}
+        for gone in [n for n in self.usages if n != LIVE_PSEUDO and n not in names]:
+            self.usages.pop(gone, None)
+            self.last_good.pop(gone, None)
+            self.state["readings"].pop(gone, None)
+        live = self.live_names()
+        todo = [acc for acc in self.accounts if acc.name not in live]
+        held = set(self.holdings(self.local)) | set(self.claims)
+        if not todo:
+            self.next_scan = now() + cfg.scan
+            return
+        self.next_scan = float("inf")     # set again when this scan is done
+        self.scan_prog = [len(todo), 0]
+        self.submit("scan", f"scanning {len(todo)} accounts", scan_accounts, cfg, todo, None, held,
+                    lambda name, u: self.post(self.on_scan_read, name, u),
+                    then=self.on_scan_done)
 
-        def scan():
-            fresh = scan_accounts(cfg, self.accounts, active, held)
-            if active is None and oauth_of(read_json(cfg.live_path)):
-                fresh[LIVE_PSEUDO] = usage_for(cfg.live_path)
-            return fresh
+    def on_scan_read(self, name: str, u: Usage) -> None:
+        if self.scan_prog:
+            self.scan_prog[1] += 1
+        if name in self.live_names() or name not in {acc.name for acc in self.accounts}:
+            return                        # a lane moved onto it meanwhile: its poll owns it now
+        self.usages[name] = u
+        self.remember_good({name: u})
+        record_samples(self.state, {name: u})
 
-        fresh = self.background(f"scanning {len(self.accounts)} accounts", scan)
-        self.usages = fresh
-        self.remember_good(fresh)
-        record_samples(self.state, fresh)
-        save_state(cfg, self.state)
-        self.next_scan = now() + cfg.scan
-        # The scan read every lane's live account the way its poll would (the
-        # live file here, a client's reported token there), so that read *is*
-        # the lane's poll: everything a poll does with its reading happens now
-        # and the next poll is due one --interval later.  Merely pushing the
-        # poll back, as before, meant that with --scan equal to --interval no
-        # poll ever ran, and the signals that only a poll sent never went out.
-        for lr in self.lanes():
-            name = lr.ls.get("active")
-            key = name or (LIVE_PSEUDO if lr.local else None)
-            if key in fresh:
-                self.take_reading(lr, name, fresh[key], sampled=True)
-            lr.next_poll = now() + cfg.interval
+    def on_scan_done(self, _v, e) -> None:
+        self.scan_prog = None
+        self.next_scan = min(self.next_scan, now() + self.cfg.scan)
+        save_state(self.cfg, self.state)
+        if e is not None:
+            raise e
 
     def poll(self, lr: LaneRt) -> None:
         """A lane's live account is polled at --interval, never faster, and a
         429 does not slow it down either (see `usage_for`).  What a limit
         needs when it is close is projection (rate × age) and the lead, not
         more reads — and not fewer.  This machine's is read through its live
-        file; a client's through the store, with the token it reported."""
+        file; a client's through the store, with the token it reported.  On
+        a worker, ahead of the scan's reads; while the lane's slot is taken
+        (a swap under way) the poll waits for it."""
+        if self.busy(lr):
+            return
         cfg, ls = self.cfg, lr.ls
-        lr.next_poll = now() + cfg.interval
         name = ls.get("active")
+        lr.next_poll = now() + cfg.interval
         if lr.local:
             if not oauth_of(read_json(cfg.live_path)):
                 return
             key = name or LIVE_PSEUDO
-            u = self.background(f"reading {key}", usage_for, cfg.live_path)
+            what, args = f"reading {key}", (cfg.live_path,)
         else:
             if not name:
                 return
             key = name
-            u = self.background(f"reading {key} ({lr.host})", usage_for,
-                                os.path.join(cfg.root, name, CRED_FILE), False)
-        if ls.get("active") != name:
+            what, args = f"reading {key} ({lr.host})", (os.path.join(cfg.root, name, CRED_FILE), False)
+        self.submit(lr.key, what, usage_for, *args, urgent=True,
+                    then=lambda u, e: self.on_polled(lr, name, key, u, e))
+
+    def on_polled(self, lr: LaneRt, name: str | None, key: str, u: "Usage | None", e) -> None:
+        if e is not None:
+            if not isinstance(e, Exception):
+                raise e
+            u = Usage()
+            u.error = f"read failed: {e}"
+        if lr.ls.get("active") != name:
             return                        # the lane moved while it was being read
         self.usages[key] = u
         self.remember_good({key: u})
         self.take_reading(lr, name, u)
 
-    def take_reading(self, lr: LaneRt, name: str | None, u: Usage, sampled: bool = False) -> None:
-        """What a lane does with a fresh reading of its live account, whether
-        its poll or a scan took it: burn sample, swap-cost measurement, and
-        the account-switch signals.  `sampled`: the scan recorded the sample."""
+    def take_reading(self, lr: LaneRt, name: str | None, u: Usage) -> None:
+        """What a lane does with a fresh reading of its live account: burn
+        sample, swap-cost measurement, and the account-switch signals."""
         cfg, ls = self.cfg, lr.ls
         if name:
-            if not sampled:
-                record_samples(self.state, {name: u})
+            record_samples(self.state, {name: u})
             measure_preload(ls, self.usages, lr.cfg)
             if not lr.online():
                 # nobody would receive them: they fire once it links again
@@ -3233,27 +3983,46 @@ class Master:
             self.clear_hold_notice(lr)
             return
         pool = self.pool(lr)
-        target = self.background(f"finding an account to park {lr.host} on", verified_parking,
-                                 cfg, pool, active)
-        self.adopt_reads(pool)
-        if not target:
-            taken = parking_target(self.usages, cfg, active)
-            why = (f"every refusing account is held by another host ({taken} by "
-                   f"{self.holdings(lr).get(taken)})" if taken and taken in self.holdings(lr)
-                   else "no account is refusing requests")
-            lr.notice = (f"peak-hour hold: {why}, so nothing to park on — "
-                         f"{active} keeps working until one is")
+        if not parking_target(pool, cfg, exclude=active):
+            self.no_parking(lr, active)       # nothing on paper: no reads needed to say so
             return
+        self.submit(lr.key, f"finding an account to park {lr.host} on", _verify_in,
+                    verified_parking, cfg, pool, active, urgent=True,
+                    then=lambda v, e: self.on_parking(lr, active, start, end, v, e))
+
+    def no_parking(self, lr: LaneRt, active: str) -> None:
+        taken = parking_target(self.usages, self.cfg, active)
+        why = (f"every refusing account is held by another host ({taken} by "
+               f"{self.holdings(lr).get(taken)})" if taken and taken in self.holdings(lr)
+               else "no account is refusing requests")
+        lr.notice = (f"peak-hour hold: {why}, so nothing to park on — "
+                     f"{active} keeps working until one is")
+
+    def on_parking(self, lr: LaneRt, active: str, start: float, end: float, v, e) -> None:
+        if e is not None:
+            if not isinstance(e, CcrollError):
+                raise e
+            lr.notice = f"peak-hour hold: {e}"
+            return
+        target, pool = v
+        self.adopt_reads(pool)
+        if not self.still(lr, active, auto=True) or self.hold_window(lr) is None:
+            return
+        if not target:
+            self.no_parking(lr, active)
+            return
+        if target in self.taken(lr):
+            return                        # another lane took it meanwhile: the next tick looks again
         self.clear_hold_notice(lr)
-        reason = f"peak-hour hold until {fmt_local(cfg, end)}"
-        if ls.get("peak_hold") == start:
+        reason = f"peak-hour hold until {fmt_local(self.cfg, end)}"
+        if lr.ls.get("peak_hold") == start:
             reason = f"re-parked, {active} was about to free up · " + reason
         # preemptive: the account left was not spent, so its cycle goes on.
         # The snapshot goes in so switch_done carries the same fields as any
         # swap, and comes straight back out: nothing re-primes on an account
         # that refuses it, so a "preload" measured here would read 0 and skew
         # the median.
-        self.swap(lr, target, reason, self.usages.get(target), preemptive=True,
+        self.swap(lr, target, reason, pool.get(target), preemptive=True,
                   parking=start, verb="parked on")
 
     def clear_hold_notice(self, lr: LaneRt) -> None:
@@ -3265,8 +4034,12 @@ class Master:
 
     # --- rotation ------------------------------------------------------------
     def maybe_rotate(self, lr: LaneRt) -> None:
+        """Every tick, for every lane that has nothing in flight: judge its
+        live account, and when it has to move, start the fresh reads that
+        pick where to.  Only the judging happens here; the reads and the
+        swap run on workers and come back through `on_target`."""
         cfg, ls = self.cfg, lr.ls
-        if self.paused or not lr.online() or ls.get("pending"):
+        if self.paused or not lr.online() or ls.get("pending") or not self.lane_free(lr):
             return
         active = ls.get("active")
         if active is None:
@@ -3308,49 +4081,92 @@ class Master:
             if cfg.preempt:
                 self.maybe_preempt(lr, active)
             return
+        self.start_rotation(lr, reason, auto=True)
+
+    def start_rotation(self, lr: LaneRt, reason: str, auto: bool, first: bool = False) -> None:
+        """The fresh reads that confirm a target (`verified_target`), on a
+        worker, ahead of any scan read; `on_target` swaps once they are in."""
+        ls = lr.ls
+        active = ls.get("active")
         pool = self.pool(lr)
-        target = self.background(f"choosing an account for {lr.host}", verified_target,
-                                 cfg, pool, active, preload_estimate(ls))
-        self.adopt_reads(pool)
-        if not target:
-            # everyone is spent: hold position and rescan the moment the first
-            # account's binding limits have reset (plus a small settle buffer)
-            recovery = earliest_recovery(pool, cfg, active, preload_estimate(ls))
-            if recovery:
-                when, who = recovery
-                lr.notice = (f"all accounts exhausted — waiting for {who} "
-                             f"(recovers in {fmt_dur(when - now())})")
-                self.next_scan = min(self.next_scan, max(when + RESCAN_MIN_S, now() + RESCAN_MIN_S))
-            else:
-                lr.notice = "active account exhausted but no fallback has headroom"
-                self.next_scan = min(self.next_scan, now() + max(RESCAN_MIN_S, cfg.interval))
+        self.submit(lr.key, f"choosing an account for {lr.host}", _verify_in, verified_target,
+                    self.cfg, pool, active, preload_estimate(ls), urgent=True,
+                    then=lambda v, e: self.on_target(lr, active, reason, auto, first, v, e))
+
+    def on_target(self, lr: LaneRt, active: str | None, reason: str, auto: bool, first: bool,
+                  v, e) -> None:
+        cfg, ls = self.cfg, lr.ls
+        if e is not None:
+            if not isinstance(e, CcrollError):
+                raise e
+            lr.notice = f"rotation failed: {e}"
             return
+        target, pool = v
+        self.adopt_reads(pool)
+        if not self.still(lr, active, auto):
+            return                        # the lane moved, lost its link or was paused meanwhile
+        if not target:
+            if first:
+                lr.notice = "no account has headroom for this host"
+            elif not auto:
+                lr.notice = "no fallback with headroom"
+            else:
+                # everyone is spent: hold position and rescan the moment the
+                # first account's binding limits have reset (plus a small
+                # settle buffer)
+                pool = self.pool(lr)
+                recovery = earliest_recovery(pool, cfg, active, preload_estimate(ls))
+                if recovery:
+                    when, who = recovery
+                    lr.notice = (f"all accounts exhausted — waiting for {who} "
+                                 f"(recovers in {fmt_dur(when - now())})")
+                    self.next_scan = min(self.next_scan, max(when + RESCAN_MIN_S, now() + RESCAN_MIN_S))
+                else:
+                    lr.notice = "active account exhausted but no fallback has headroom"
+                    self.next_scan = min(self.next_scan, now() + max(RESCAN_MIN_S, cfg.interval))
+            return
+        if target in self.taken(lr):
+            return                        # another lane took it meanwhile: the next tick picks again
         self.clear_hold_notice(lr)
-        self.swap(lr, target, reason, self.usages.get(target))
+        self.swap(lr, target, "first account for this host" if first else reason, pool.get(target))
 
     def maybe_preempt(self, lr: LaneRt, active: str) -> None:
         """Pre-emptive move while the active account still has headroom; the
         target is confirmed with a fresh read like any other swap."""
         cfg, ls = self.cfg, lr.ls
-        pool = self.pool(lr)
-        choice = preempt_target(cfg, ls, pool, active)
+        choice = preempt_target(cfg, ls, self.pool(lr), active)
         if not choice:
             return
+        try:
+            path = get_account(cfg, choice[0]).cred_path
+        except CcrollError:
+            return
+        self.submit(lr.key, f"checking {choice[0]} for {lr.host}", usage_for, path, urgent=True,
+                    then=lambda fresh, e: self.on_preempt_read(lr, active, choice, fresh, e))
+
+    def on_preempt_read(self, lr: LaneRt, active: str, choice: tuple, fresh, e) -> None:
+        cfg, ls = self.cfg, lr.ls
+        if e is not None:
+            if not isinstance(e, Exception):
+                raise e
+            return
         target, why = choice
-        fresh = self.background(f"checking {target} for {lr.host}", usage_for,
-                                get_account(cfg, target).cred_path)
-        if fresh.error or ls.get("active") != active or ls.get("pending") \
-                or target in self.holdings(lr):
+        if fresh.error or not self.still(lr, active, auto=True) or target in self.taken(lr):
             return                        # unreadable, or the fleet moved meanwhile
-        self.usages[target] = pool[target] = fresh
+        self.adopt_reads({target: fresh})
         if is_exhausted(fresh, cfg) or not comfortable(fresh, cfg, preload_estimate(ls)):
             return
+        pool = dict(self.pool(lr), **{target: fresh})
         if preempt_target(cfg, ls, pool, active) != choice:
             return                        # the fresh read changed the picture
         self.swap(lr, target, why, fresh, preemptive=True, verb="moved early to")
 
     def manual_rotate(self, lr: LaneRt, reason: str) -> None:
-        """[r] on the master for its own lane, or a client asking for its own."""
+        """[r] on the master for its own lane, or a client asking for its own.
+        While the lane has something in flight the request is not dropped:
+        a swap already under way is said to be, anything else (a poll, the
+        reads of an automatic rotation) is waited for and the rotation then
+        starts (`step`)."""
         ls = lr.ls
         hold = self.hold_window(lr)
         if hold:
@@ -3363,54 +4179,111 @@ class Master:
         if ls.get("pending"):
             lr.notice = f"a swap to {ls['pending'].get('to')} is already under way"
             return
-        pool = self.pool(lr)
-        target = self.background(f"choosing an account for {lr.host}", verified_target,
-                                 self.cfg, pool, ls.get("active"), preload_estimate(ls))
-        self.adopt_reads(pool)
-        if target:
-            self.swap(lr, target, reason, self.usages.get(target))
-        else:
-            lr.notice = "no fallback with headroom"
+        what = self.tasks.get(lr.key)
+        if what and what.startswith(("swapping", "preparing")):
+            lr.notice = f"a rotation is already under way ({what})"
+            return
+        if not self.lane_free(lr):
+            lr.want_rotate = reason
+            lr.notice = f"rotation queued — it starts once {what or 'the live login is checked'} is done"
+            return
+        self.start_rotation(lr, reason, auto=False)
 
     def assign(self, lr: LaneRt) -> None:
-        pool = self.pool(lr)
-        target = self.background(f"choosing an account for {lr.host}", verified_target,
-                                 self.cfg, pool, None, preload_estimate(lr.ls))
-        self.adopt_reads(pool)
-        if target:
-            self.swap(lr, target, "first account for this host", self.usages.get(target))
-        else:
-            lr.notice = "no account has headroom for this host"
+        self.start_rotation(lr, "first account for this host", auto=True, first=True)
 
     def swap(self, lr: LaneRt, target: str, reason: str, snapshot: "Usage | None",
              preemptive: bool = False, parking: float | None = None, verb: str = "rotated to") -> None:
-        """Move a lane to `target`.  This machine's lane swaps at once; a
-        client's is sent the target's credentials and commits when the
-        client reports the swap done (`finish_swap`)."""
+        """Move a lane to `target`.  The target is claimed first, so no scan
+        refreshes it while the swap prepares it.  This machine's lane swaps
+        on a worker and commits when it is done (`on_local_swapped`); a
+        client's is sent the target's credentials once they are prepared,
+        and commits when the client reports the swap done (`finish_swap`)."""
         cfg, ls = self.cfg, lr.ls
         try:
-            if lr.local:
-                detail = do_swap(cfg, ls, get_account(cfg, target), reason, snapshot, preemptive,
-                                 run=lambda fn, *args: self.background(f"swapping to {target}",
-                                                                       fn, *args))
-                self.monitor.note_own_write()
-                if parking is not None:
-                    ls["swap_snapshot"] = None
-                    ls["peak_hold"] = parking
-                    save_state(cfg, ls)
-                lr.notice = f"{verb} {target} ({detail})"
-                self.poll(lr)
-                return
-            creds = self.background(f"preparing {target} for {lr.host}", prepare_creds,
-                                    cfg, get_account(cfg, target))
+            acc = get_account(cfg, target)
         except CcrollError as e:
             lr.notice = f"rotation failed: {e}"
             add_event(ls, lr.notice)
             save_state(cfg, ls)
             return
+        self.claims[target] = lr.host
+        self.guard()
+        prev = ls.get("active")
+        args = (lr, prev, target, reason, snapshot, preemptive, parking, verb)
+        if lr.local:
+            ok = self.submit(lr.key, f"swapping to {target}", swap_live, cfg, prev, acc, urgent=True,
+                             then=lambda v, e: self.on_local_swapped(*args, v, e))
+        else:
+            ok = self.submit(lr.key, f"preparing {target} for {lr.host}", prepare_creds, cfg, acc,
+                             urgent=True, then=lambda v, e: self.on_prepared(*args, v, e))
+        if not ok:
+            self.claims.pop(target, None)
+            return
+        lr.notice = f"swapping to {target} …"
+
+    def swap_failed(self, lr: LaneRt, e) -> None:
+        if not isinstance(e, (CcrollError, OSError)):
+            raise e
+        lr.notice = f"rotation failed: {e}"
+        add_event(lr.ls, lr.notice)
+        save_state(self.cfg, lr.ls)
+
+    def on_local_swapped(self, lr: LaneRt, prev, target, reason, snapshot, preemptive, parking,
+                         verb, v, e) -> None:
+        self.claims.pop(target, None)
+        cfg, ls = self.cfg, lr.ls
+        if e is not None:
+            self.swap_failed(lr, e)
+            return
+        creds, old, note = v
+        detail = commit_swap(cfg, ls, target, reason, snapshot, preemptive)
+        if note:
+            add_event(ls, note)
+        self.remember_swap_read(target, snapshot)
+        self.monitor.note_own_write()
+        if parking is not None:
+            ls["swap_snapshot"] = None
+            ls["peak_hold"] = parking
+        save_state(cfg, ls)
+        lr.notice = f"{verb} {target} ({detail})"
+        lr.next_poll = 0.0
+        # the re-check a moment later, as a deadline: nothing waits for it,
+        # but this machine's live file is not judged until it has run
+        self.reassert = (creds, old, target)
+        self.at(now() + SWAP_VERIFY_DELAY_S, self.start_reassert)
+
+    def start_reassert(self) -> None:
+        if self.reassert is None:
+            return
+        creds, old, target = self.reassert
+        if not self.submit("reassert", "re-checking the swap", reassert_live, self.cfg, creds, old,
+                           target, then=self.on_reasserted):
+            self.at(now() + SWAP_VERIFY_DELAY_S, self.start_reassert)
+
+    def on_reasserted(self, again, e) -> None:
+        self.reassert = None
+        if e is not None and not isinstance(e, OSError):
+            raise e
+        if again:
+            add_event(self.local.ls, "re-asserted swap over a concurrent write")
+            save_state(self.cfg, self.state)
+        self.monitor.note_own_write()
+
+    def on_prepared(self, lr: LaneRt, prev, target, reason, snapshot, preemptive, parking,
+                    verb, creds, e) -> None:
+        self.claims.pop(target, None)
+        cfg, ls = self.cfg, lr.ls
+        if e is not None:
+            self.swap_failed(lr, e)
+            return
+        if lr.conn is None or ls.get("active") != prev or ls.get("pending"):
+            lr.notice = ""                # the link went or the lane moved meanwhile: decided afresh
+            return
         sid = f"{lr.host}-{int(now() * 1000):x}"
         ls["pending"] = {"id": sid, "to": target, "reason": reason, "preemptive": preemptive,
                          "parking": parking, "verb": verb, "t": now()}
+        self.guard()
         lr.pending_snapshot = snapshot
         lr.conn.send({"type": "swap", "id": sid, "to": target, "credentials": creds,
                       "identity": stored_identity(cfg, target)})
@@ -3429,6 +4302,7 @@ class Master:
         ls["bare"] = False
         detail = commit_swap(lr.cfg, ls, target, pend.get("reason") or "", lr.pending_snapshot,
                              bool(pend.get("preemptive")))
+        self.remember_swap_read(target, lr.pending_snapshot)
         lr.pending_snapshot = None
         if result.get("identity_note"):
             add_event(ls, result["identity_note"])
@@ -3439,9 +4313,74 @@ class Master:
             ls["peak_hold"] = pend["parking"]
         lr.notice = f"{pend.get('verb') or 'rotated to'} {target} ({detail})"
         save_state(self.cfg, ls)
-        self.poll(lr)
+        lr.next_poll = 0.0
+
+    # --- this machine's live file ---------------------------------------------
+    def check_live(self) -> None:
+        """A change to the live file nobody here made — the CLI's own token
+        refresh, or a /login by hand — is named by its profile on a worker,
+        and applied (`LiveMonitor.apply`) once it is.  Not while this lane
+        has work in flight: its own swap writes that file."""
+        if self.busy(self.local) or self.live_unsettled():
+            return
+        oauth = self.monitor.changed()
+        if oauth is None:
+            return
+        st = self.state
+        active = st.get("active")
+        self.submit("live-id", "naming the live login", identify_live, self.cfg,
+                    oauth["accessToken"], active, st["emails"].get(active), urgent=True,
+                    then=lambda email, e: self.on_live_named(oauth, email, e))
+
+    def on_live_named(self, oauth: dict, v, e) -> None:
+        if e is not None:
+            raise e
+        email, note = v
+        if note:
+            add_event(self.state, note)
+        msg = self.monitor.apply(oauth, email)
+        if msg:
+            self.local.notice = msg
 
     # --- the link ------------------------------------------------------------
+    def take_messages(self) -> None:
+        """Apply what the links sent, in order per link.  A message that
+        files an account's credentials or claims it for a host (a hello, a
+        creds report, a swap result) is applied only while that account's
+        locks can be had at once — never mid-way through a worker's refresh
+        of it, and never with a wait: when they cannot, it stays in the
+        backlog for the next turn, with everything after it from the same
+        link.  Holding them, the change of who holds what reaches the
+        workers (`guard`) before any of them can look again."""
+        waiting, self.backlog = self.backlog, []
+        stalled = set()
+        for c, msg in waiting:
+            if c in stalled:
+                self.backlog.append((c, msg))
+                continue
+            with try_hold(self.msg_paths(msg)) as held:
+                if not held:
+                    stalled.add(c)
+                    self.backlog.append((c, msg))
+                    continue
+                self.handle_message(c, msg)
+                self.guard()
+
+    def msg_paths(self, msg) -> list:
+        """The store credentials a message would write, or change the owner of."""
+        if not isinstance(msg, dict):
+            return []
+        kind, names = msg.get("type"), []
+        if kind == "hello":
+            names = [msg.get("holds")] + [r.get("from") for r in (msg.get("returns") or [])
+                                          if isinstance(r, dict)]
+        elif kind == "creds":
+            names = [msg.get("email")]
+        elif kind == "swapped":
+            names = [msg.get("from")]
+        return [os.path.join(self.cfg.root, n, CRED_FILE) for n in names
+                if isinstance(n, str) and NAME_RE.match(n)]
+
     def handle_message(self, c: Conn, msg: dict | None) -> None:
         """One message, and a link that sends one this master cannot act on
         is closed — never the master brought down by it."""
@@ -3477,6 +4416,9 @@ class Master:
         kind = msg.get("type")
         if kind == "release":
             self.on_release(c, str(msg.get("host") or ""))
+            return
+        if kind == "note":
+            self.on_note(c, msg)
             return
         if kind == "hello":
             self.on_hello(c, msg)
@@ -3680,6 +4622,29 @@ class Master:
         c.send({"type": "released", "ok": ok, "msg": text})
         c.closing = True
 
+    def on_note(self, c: Conn, msg: dict) -> None:
+        """A local command's line for the log — and, from `ccroll add` and
+        `ccroll adopt`, the account it filed, and from `adopt` that it is the
+        live login here: the running master owns state.json and rewrites it
+        from memory, so a command saving it directly would be undone."""
+        text, email, live = _str(msg.get("event")), _str(msg.get("email")), _str(msg.get("live"))
+        self.accounts[:] = list_accounts(self.cfg)
+        ok, reply = True, "recorded"
+        if email:
+            self.state["emails"][email] = email
+        if text:
+            add_event(self.state, text[:300])
+        if live and self.state.get("active") != live:
+            other = self.holdings(self.local).get(live)
+            if other:
+                ok, reply = False, f"{live} is live on {other} — not marked live here"
+            elif live in {acc.name for acc in self.accounts}:
+                self.state["active"], self.state["active_since"] = live, now()
+                add_event(self.state, f"live login is {live}")
+        save_state(self.cfg, self.state)
+        c.send({"type": "noted", "ok": ok, "msg": reply})
+        c.closing = True
+
     def push_views(self) -> None:
         """Each linked client is sent its fleet view whenever it changes —
         rendered here at that client's terminal size, with its own lane as
@@ -3766,6 +4731,9 @@ class Master:
                     text = "linked" + (f" · {c.sessions} session{'' if c.sessions == 1 else 's'}"
                                        if c.sessions is not None else "")
                     link = (a.green(text), len(text))
+            elif any(isinstance(m, dict) and m.get("type") == "hello" and m.get("host") == lr.host
+                     for _, m in self.backlog):
+                link = (a.yellow("linking…"), 8)    # its hello waits on an account's lock
             else:
                 off = ls.get("offline_since")
                 text = f"offline since {fmt_clock(off)}" if off else "offline"
@@ -3818,7 +4786,8 @@ class Master:
                              f"or ≤{cfg.lead:.0f}s from a limit{early}")) + peak
         # what the master is waiting on goes up front: the line is cut to
         # the terminal's width, and this is what explains a pause
-        busy = (a.yellow(f"⟳ {self.busy}…") + a.dim("  ·  ")) if self.busy else ""
+        busy = self.busy_text()
+        busy = (a.yellow(f"⟳ {busy}") + a.dim("  ·  ")) if busy else ""
         head = a.bold(f"ccroll {CCROLL_VERSION}") + a.dim("  ·  ") + busy + mode
         if clock:
             head += a.dim("  ·  ") + fmt_clock(now())
@@ -3830,6 +4799,8 @@ class Master:
             role = a.cyan(where) + a.dim(f"  ·  {linked} of {len(self.remote)} client hosts linked")
         lines = [head, role]
         view = merged_view(self.usages, self.last_good, [lr.ls for lr in self.lanes()])
+        for name, u in self.seed_view.items():
+            view.setdefault(name, u)      # last run's samples, until this run reads it
         lines += render_table(a, self.table_rows(viewer, view, a), label)
         if fleet:
             lines += [""] + self.render_hosts(viewer, a, view)
@@ -3874,8 +4845,94 @@ class Master:
             lines += ["", a.dim("[q]uit  [r]otate now  [s]can  [p]ause auto-rotate")]
         return "\n".join(lines)
 
+    def busy_text(self) -> str:
+        """What is in flight, for the header: the scan's progress first."""
+        parts = []
+        if self.scan_prog:
+            parts.append(f"scanning {self.scan_prog[0]} accounts · {self.scan_prog[1]} read")
+        parts += [f"{what}…" for key, what in self.tasks.items() if key != "scan"]
+        return "  ·  ".join(parts)
+
     # --- the loop ------------------------------------------------------------
+    def step(self) -> None:
+        """One turn of everything but the keys and the links: results that
+        came back, deadlines that came, then what is due — the scan, each
+        lane's poll, the live file, each lane's rotation.  Never waits."""
+        self.drain()
+        self.run_timers()
+        self.guard()
+        self.log_trouble()
+        if self.quitting:
+            return
+        if now() >= self.next_scan:
+            self.rescan()
+        for lr in self.lanes():
+            if now() >= lr.next_poll:
+                self.poll(lr)
+        self.check_live()
+        for lr in self.lanes():
+            if lr.want_rotate and self.lane_free(lr):
+                reason, lr.want_rotate = lr.want_rotate, None
+                self.manual_rotate(lr, reason)
+            else:
+                self.maybe_rotate(lr)
+
+    def tick(self) -> float:
+        """How long the loop may wait for a key or a message: a second, or
+        less when a deadline comes sooner."""
+        soon = min((when for when, _ in self.timers), default=None)
+        return 1.0 if soon is None else max(0.0, min(1.0, soon - now()))
+
+    def wait(self, timeout: float) -> tuple[str | None, list]:
+        """A key or messages, whichever comes first, or a worker finishing."""
+        if self.server is not None:
+            return self.server.wait(timeout, self.kb)
+        rl = [self.wake_r] + ([sys.stdin] if self.kb.enabled else [])
+        try:
+            r, _, _ = select.select(rl, [], [], timeout)
+        except InterruptedError:
+            return None, []
+        if self.wake_r in r:
+            with contextlib.suppress(OSError):
+                os.read(self.wake_r, 4096)
+        return (sys.stdin.read(1) if sys.stdin in r else None), []
+
+    def quit_waits(self) -> str:
+        """What quitting has to wait for — a refresh token the server has
+        rotated but not yet been written down, or a swap between its live
+        write and its commit, would each lose an account's login — or ""."""
+        n = refreshes_in_flight()
+        what = self.tasks.get(self.local.key) or ""
+        if what.startswith("swapping"):
+            return what.replace("swapping", "the swap", 1) + " to land"
+        if n:
+            return f"{n} refreshed token{'s' if n > 1 else ''} to be saved"
+        return ""
+
+    def on_key(self, key: str) -> bool:
+        """One key, at once, whatever is in flight.  True: quit now."""
+        if key in ("q", "\x03"):
+            if self.quitting:
+                return True               # asked twice: now
+            self.quitting = True
+            waits = self.quit_waits()
+            if waits:
+                self.local.notice = f"quitting once {waits} — press q again to quit now"
+        elif key == "s":
+            if self.scan_prog:
+                self.local.notice = (f"a scan is already under way "
+                                     f"({self.scan_prog[1]} of {self.scan_prog[0]} read)")
+            else:
+                self.next_scan = 0
+        elif key == "p":
+            self.paused = not self.paused
+            self.local.notice = "auto-rotation paused" if self.paused else "auto-rotation resumed"
+        elif key == "r":
+            self.manual_rotate(self.local, "manual (keypress)")
+        return False
+
     def run(self) -> int:
+        global UI_THREAD, SIGNAL_WRITER
         cfg, a = self.cfg, self.a
         if not self.accounts:
             print(a.yellow("No accounts under " + cfg.root))
@@ -3887,9 +4944,9 @@ class Master:
             if warn:
                 print(a.yellow("⚠ " + warn))
                 print(a.dim("  (it applies after a CLI restart; ccroll never edits your settings)"))
-                time.sleep(2)
+                time.sleep(2)             # before the dashboard: time to read it
         try:
-            self.server = Server(cfg)
+            self.server = Server(cfg, self.wake_r)
         except OSError as e:
             # a filesystem that cannot hold a Unix socket: this machine is
             # still rotated as ever, only no client can link
@@ -3900,70 +4957,63 @@ class Master:
         if self.tty_out:
             sys.stdout.write("\033[?1049h\033[?25l")
             sys.stdout.flush()
+        UI_THREAD = threading.current_thread()
+        SIGNAL_WRITER = SignalWriter()
         try:
             with Keyboard() as kb:
                 self.kb = kb
-                running = True
-                while running:
-                    if now() >= self.next_scan:
-                        self.rescan()
-                    for lr in self.lanes():
-                        if now() >= lr.next_poll:
-                            self.poll(lr)
-                    changed = self.monitor.check()
-                    if changed:
-                        self.local.notice = changed
-                    for lr in self.lanes():
-                        self.maybe_rotate(lr)
+                while True:
+                    self.step()
                     self.draw()
                     self.push_views()
-                    key, msgs = (self.server.wait(1.0, kb) if self.server is not None
-                                 else (kb.read(1.0), []))
-                    # what arrived while a read was under way goes first, in order
-                    msgs, self.backlog = self.backlog + msgs, []
-                    for c, msg in msgs:
-                        self.handle_message(c, msg)
-                    keys, self.keys = self.keys + ([key] if key else []), []
-                    for key in keys:
-                        if key in ("q", "\x03"):
-                            running = False
-                        elif key == "s":
-                            self.next_scan = 0
-                        elif key == "p":
-                            self.paused = not self.paused
-                            self.local.notice = ("auto-rotation paused" if self.paused
-                                                 else "auto-rotation resumed")
-                        elif key == "r":
-                            self.manual_rotate(self.local, "manual (keypress)")
+                    if self.quitting and not self.quit_waits():
+                        break
+                    key, msgs = self.wait(self.tick())
+                    self.backlog += msgs
+                    self.take_messages()
+                    if key and self.on_key(key):
+                        break
         finally:
             if self.tty_out:
                 sys.stdout.write("\033[?25h\033[?1049l")
                 sys.stdout.flush()
             if self.server is not None:
                 self.server.close()
+            if self.reassert is not None:
+                # the re-check is owed: file work only, so it is done now
+                with contextlib.suppress(Exception):
+                    if reassert_live(cfg, *self.reassert):
+                        add_event(self.state, "re-asserted swap over a concurrent write")
             save_state(cfg, self.state)
+            writer, SIGNAL_WRITER, UI_THREAD = SIGNAL_WRITER, None, None
+            writer.close()                # every queued feed line lands before we go
+            for fd in (self.wake_r, self.wake_w):
+                with contextlib.suppress(OSError):
+                    os.close(fd)
         return 0
 
     def draw(self) -> None:
         """This machine's screen: the dashboard on a terminal, a line per
-        poll otherwise."""
+        new reading otherwise."""
         a = self.a
         if self.tty_out:
             size = shutil.get_terminal_size()
             frame = fit_frame(self.render(self.local, a), size.columns, size.lines)
             sys.stdout.write("\033[H" + frame.replace("\n", "\033[K\n") + "\033[K\033[J")
             sys.stdout.flush()
-        elif self.printed != self.local.next_poll and self.busy is None:
-            self.printed = self.local.next_poll
-            act = self.local.ls.get("active") or LIVE_PSEUDO
-            u = self.usages.get(act)
-            notice = self.local.notice
-            if u and not u.error:
-                print(f"{fmt_clock(now())} active={act} session={u.session_pct or 0:.0f}% "
-                      f"weekly={u.weekly_pct or 0:.0f}% scoped={u.scoped_pct or 0:.0f}%"
-                      + (f" · {notice}" if notice else ""), flush=True)
-            elif u:
-                print(f"{fmt_clock(now())} active={act} error: {u.error}", flush=True)
+            return
+        act = self.local.ls.get("active") or LIVE_PSEUDO
+        u = self.usages.get(act)
+        notice = self.local.notice
+        if u is None or (u.fetched_at, notice) == self.printed:
+            return
+        self.printed = (u.fetched_at, notice)
+        if not u.error:
+            print(f"{fmt_clock(now())} active={act} session={u.session_pct or 0:.0f}% "
+                  f"weekly={u.weekly_pct or 0:.0f}% scoped={u.scoped_pct or 0:.0f}%"
+                  + (f" · {notice}" if notice else ""), flush=True)
+        else:
+            print(f"{fmt_clock(now())} active={act} error: {u.error}", flush=True)
 
 
 def cmd_watch(cfg: Cfg, a: Ansi, as_master: bool = False) -> int:
@@ -3994,7 +5044,12 @@ class Client:
     elsewhere.  It keeps no store and makes no decisions: it reports what
     its live login is (and every token the CLI refreshes), carries out the
     swaps the master sends, writes the account-switch feed for its own
-    sessions, and shows the fleet view the master renders for it."""
+    sessions, and shows the fleet view the master renders for it.
+
+    Like the master's, its loop never waits on anything slow: naming a
+    login (a profile request), a swap's file work and its re-check a moment
+    later all run on workers or as deadlines, and the link to ssh is
+    written without blocking, so a key is handled within one tick."""
 
     def __init__(self, cfg: Cfg, a: Ansi, master: str, cmd: list, host: str,
                  link: dict | None = None):
@@ -4024,9 +5079,57 @@ class Client:
         self.recheck_at = 0.0
         self.live_mtime = _mtime_ns(cfg.live_path)
         self.expected = (oauth_of(read_json(cfg.live_path)) or {}).get("accessToken")
+        self.outbuf = b""                      # to the link, as the pipe takes it
+        self.gen = 0                           # which link a late answer was meant for
+        self.done: queue.SimpleQueue = queue.SimpleQueue()
+        self.wake_r, self.wake_w = os.pipe()
+        os.set_blocking(self.wake_r, False)
+        os.set_blocking(self.wake_w, False)
+        self.task_n = itertools.count()
+        self.tasks: set = set()
+        self.timers: list = []
+        self.swapping: dict | None = None      # the swap between its write and its report
+        self.swaps_waiting: list = []
+        self.quitting = False
 
     def save(self) -> None:
         write_json_atomic(self.path, self.cs)
+
+    # --- work off this thread ------------------------------------------------
+    def submit(self, fn, *args, then) -> None:
+        """fn(*args) on a worker; then(value, error) back on this thread."""
+        key = next(self.task_n)
+        self.tasks.add(key)
+
+        def work():
+            v = e = None
+            try:
+                with urgent_requests():   # this machine's only reads: nothing to be ahead of
+                    v = fn(*args)
+            except BaseException as ex:
+                e = ex
+            self.done.put((key, then, v, e))
+            with contextlib.suppress(OSError):
+                os.write(self.wake_w, b"x")
+
+        threading.Thread(target=work, daemon=True, name="ccroll client").start()
+
+    def drain(self) -> None:
+        while True:
+            try:
+                key, then, v, e = self.done.get_nowait()
+            except queue.Empty:
+                break
+            self.tasks.discard(key)
+            then(v, e)
+        due = [x for x in self.timers if x[0] <= now()]
+        self.timers = [x for x in self.timers if x[0] > now()]
+        for _, fn in due:
+            fn()
+
+    def tick(self) -> float:
+        soon = min((when for when, _ in self.timers), default=None)
+        return 1.0 if soon is None else max(0.0, min(1.0, soon - now()))
 
     def note_held(self, email: str, oauth: dict | None) -> None:
         self.cs["held"] = email
@@ -4034,44 +5137,59 @@ class Client:
         self.cs["held_access"] = (oauth or {}).get("accessToken")
         self.save()
 
-    def identify(self) -> tuple[str | None, dict | None]:
-        """Which account the live credentials are, and the credentials.  The
-        tokens we last knew for it answer without a request; otherwise the
-        account's own profile endpoint names it (a read, no refresh)."""
+    def identify(self, then) -> None:
+        """Which account the live credentials are, and the credentials,
+        handed to then(email, creds).  The tokens we last knew for it answer
+        at once; otherwise the account's own profile endpoint names it (a
+        read, no refresh) — on a worker, and `then` runs once it answers."""
         creds = read_json(self.cfg.live_path)
         oauth = oauth_of(creds)
         if not oauth:
             self.unknown = False
-            return None, None
+            then(None, None)
+            return
         held = self.cs.get("held")
         if held and (oauth.get("accessToken") == self.cs.get("held_access")
                      or (oauth.get("refreshToken")
                          and oauth.get("refreshToken") == self.cs.get("held_refresh"))):
-            email = held
-        else:
-            email = fetch_email(oauth["accessToken"])
+            self.named(held, oauth, creds, then)
+            return
+        self.submit(fetch_email, oauth["accessToken"],
+                    then=lambda email, e: self.named(email if e is None else None, oauth, creds, then))
+
+    def named(self, email: str | None, oauth: dict, creds: dict, then) -> None:
         self.unknown = email is None
         if email is None:
             self.recheck_at = now() + self.cfg.interval
-            return None, creds
+            then(None, creds)
+            return
         self.expected = oauth["accessToken"]
-        if email != held or oauth.get("accessToken") != self.cs.get("held_access"):
+        if email != self.cs.get("held") or oauth.get("accessToken") != self.cs.get("held_access"):
             self.note_held(email, oauth)
-        return email, creds
+        then(email, creds)
 
     # --- the link ------------------------------------------------------------
     def send(self, msg: dict) -> None:
         if self.proc is None:
             return
+        self.outbuf += frame_msg(msg)
+        self.flush_out()
+
+    def flush_out(self) -> None:
+        """Write what the pipe to ssh takes now; the rest waits for `pump`."""
         try:
-            self.proc.stdin.write(frame_msg(msg))
-            self.proc.stdin.flush()
+            while self.outbuf:
+                n = os.write(self.proc.stdin.fileno(), self.outbuf)
+                self.outbuf = self.outbuf[n:]
+        except BlockingIOError:
+            pass
         except (BrokenPipeError, OSError, ValueError):
             self.drop("the link broke")
 
     def connect(self) -> None:
         self.tries += 1
-        self.inbuf, self.errtail = b"", ""
+        self.inbuf, self.errtail, self.outbuf = b"", "", b""
+        self.gen += 1
         try:
             self.proc = subprocess.Popen(self.cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                          stderr=subprocess.PIPE, bufsize=0, start_new_session=True)
@@ -4080,9 +5198,14 @@ class Client:
             self.problem = f"cannot start {self.cmd[0]}: {e.strerror or e}"
             self.next_try = now() + self.cfg.interval
             return
-        os.set_blocking(self.proc.stdout.fileno(), False)
-        os.set_blocking(self.proc.stderr.fileno(), False)
-        email, creds = self.identify()
+        for pipe in (self.proc.stdin, self.proc.stdout, self.proc.stderr):
+            os.set_blocking(pipe.fileno(), False)
+        gen = self.gen
+        self.identify(lambda email, creds: self.hello(gen, email, creds))
+
+    def hello(self, gen: int, email: str | None, creds: dict | None) -> None:
+        if gen != self.gen or self.proc is None:
+            return                        # named for a link that is gone
         # a live login we cannot name right now (the profile read failed) is
         # most likely still the one we last knew: claim it as unverified, so
         # the master keeps it held rather than free to be refreshed elsewhere
@@ -4099,6 +5222,8 @@ class Client:
 
     def drop(self, reason: str) -> None:
         proc, self.proc = self.proc, None
+        self.outbuf = b""
+        self.gen += 1
         if proc is not None:
             with contextlib.suppress(OSError):
                 proc.kill()
@@ -4168,7 +5293,12 @@ class Client:
     def carry_out(self, msg: dict) -> None:
         """The swap the master decided, done here exactly as the master does
         its own; the previous account's newest tokens go back with the
-        result, which is kept until acknowledged."""
+        result, which is kept until acknowledged.  The write and naming the
+        account left run on a worker, the re-check a moment later is a
+        deadline, and the result goes out once both are done."""
+        if self.swapping is not None:
+            self.swaps_waiting.append(msg)
+            return
         to = msg.get("to")
         # the tokens going back are filed as the account they are: the one we
         # hold when the live file is still that account's lineage, else
@@ -4176,31 +5306,56 @@ class Client:
         # /login by hand) — and nothing, when it cannot be named
         live = oauth_of(read_json(self.cfg.live_path)) or {}
         held = self.cs.get("held")
+        left, name_token = None, None
         if held and live and (live.get("accessToken") == self.cs.get("held_access")
                               or live.get("refreshToken") == self.cs.get("held_refresh")):
             left = held
         elif live:
-            left, _ = self.identify()
-        else:
-            left = None
-        try:
-            old_creds, note, again = client_swap(self.cfg, to, msg.get("credentials"),
-                                                 msg.get("identity"))
-            result = {"type": "swapped", "id": msg.get("id"), "ok": True, "to": to,
-                      "from": left, "from_credentials": old_creds if left else None,
-                      "identity_note": note, "reasserted": again}
-            oauth = oauth_of(msg.get("credentials"))
-            self.note_held(to, oauth)
-            self.expected = (oauth or {}).get("accessToken")
-            self.live_mtime = _mtime_ns(self.cfg.live_path)
-            self.unknown = False
-            self.notice = f"swapped to {to}"
-            self.cs["returns"].append(result)
-            self.save()
-        except (CcrollError, OSError) as e:
-            result = {"type": "swapped", "id": msg.get("id"), "ok": False, "error": str(e)}
+            name_token = live.get("accessToken")
+        self.swapping = {"to": to}
+        self.submit(client_swap_step, self.cfg, to, msg.get("credentials"), msg.get("identity"),
+                    name_token, then=lambda v, e: self.swap_written(msg, left, v, e))
+
+    def swap_written(self, msg: dict, left: str | None, v, e) -> None:
+        to = msg.get("to")
+        if e is not None:
+            if not isinstance(e, (CcrollError, OSError)):
+                raise e
             self.notice = f"swap to {to} failed: {e}"
+            self.swap_reported({"type": "swapped", "id": msg.get("id"), "ok": False, "error": str(e)})
+            return
+        old_creds, note, named = v
+        oauth = oauth_of(msg.get("credentials"))
+        self.note_held(to, oauth)
+        self.expected = (oauth or {}).get("accessToken")
+        self.live_mtime = _mtime_ns(self.cfg.live_path)
+        self.unknown = False
+        self.notice = f"swapped to {to}"
+
+        def recheck():
+            self.submit(client_swap_recheck, self.cfg, to, msg.get("credentials"), old_creds,
+                        msg.get("identity"),
+                        then=lambda v2, e2: self.swap_checked(msg, left or named, old_creds, note,
+                                                              v2, e2))
+        self.timers.append((now() + SWAP_VERIFY_DELAY_S, recheck))
+
+    def swap_checked(self, msg: dict, left: str | None, old_creds, note, v, e) -> None:
+        if e is not None:
+            raise e
+        note2, again = v
+        result = {"type": "swapped", "id": msg.get("id"), "ok": True, "to": msg.get("to"),
+                  "from": left, "from_credentials": old_creds if left and oauth_of(old_creds) else None,
+                  "identity_note": note2 or note, "reasserted": again}
+        self.live_mtime = _mtime_ns(self.cfg.live_path)
+        self.cs["returns"].append(result)
+        self.save()
+        self.swap_reported(result)
+
+    def swap_reported(self, result: dict) -> None:
+        self.swapping = None
         self.send(result)
+        if self.swaps_waiting:
+            self.carry_out(self.swaps_waiting.pop(0))
 
     def apply_signal(self, msg: dict) -> None:
         if not self.cfg.signal:
@@ -4215,7 +5370,10 @@ class Client:
 
     def watch_live(self) -> None:
         """The CLI refreshing the live token, or a manual login: tell the
-        master, so its copy of the tokens is always the newest."""
+        master, so its copy of the tokens is always the newest.  Not while
+        a swap is between its write and its report: that change is ours."""
+        if self.swapping is not None:
+            return
         m = _mtime_ns(self.cfg.live_path)
         due = self.unknown and now() >= self.recheck_at
         if m == self.live_mtime and not due:
@@ -4224,9 +5382,10 @@ class Client:
         oauth = oauth_of(read_json(self.cfg.live_path))
         if not oauth or (oauth.get("accessToken") == self.expected and not due):
             return
-        email, creds = self.identify()
-        if email and self.linked:
-            self.send({"type": "creds", "email": email, "credentials": creds})
+        def report(email, creds):
+            if email and self.linked:
+                self.send({"type": "creds", "email": email, "credentials": creds})
+        self.identify(report)
 
     def beat(self, size) -> None:
         self.size = size
@@ -4236,16 +5395,24 @@ class Client:
                    "color": self.a.enabled, "interval": self.cfg.interval})
 
     def pump(self, timeout: float, kb: "Keyboard") -> str | None:
-        rl = [sys.stdin] if kb.enabled else []
+        rl = [self.wake_r] + ([sys.stdin] if kb.enabled else [])
+        wl = []
         if self.proc is not None:
             rl += [self.proc.stdout, self.proc.stderr]
+            if self.outbuf:
+                wl.append(self.proc.stdin)
         try:
-            r, _, _ = select.select(rl, [], [], timeout)
+            r, w, _ = select.select(rl, wl, [], timeout)
         except InterruptedError:
             return None
+        if w and self.proc is not None:
+            self.flush_out()
         key = None
         for f in r:
-            if f is sys.stdin:
+            if f == self.wake_r:
+                with contextlib.suppress(OSError):
+                    os.read(self.wake_r, 4096)
+            elif f is sys.stdin:
                 key = sys.stdin.read(1)
             elif self.proc is not None and f is self.proc.stderr:
                 with contextlib.suppress(BlockingIOError):
@@ -4313,7 +5480,13 @@ class Client:
         frame = "\n".join([head, status, body, "", a.dim("[q]uit  [r]otate this host now")])
         return fit_frame(frame, size.columns, size.lines)
 
+    def quit_waits(self) -> str:
+        """A swap between its live write and its report would lose the
+        previous account's newest tokens if the client went now."""
+        return f"the swap to {self.swapping['to']} is reported" if self.swapping else ""
+
     def run(self) -> int:
+        global UI_THREAD, SIGNAL_WRITER
         cfg, a = self.cfg, self.a
         if cfg.signal:
             signal_init(cfg, self.cs)
@@ -4321,17 +5494,21 @@ class Client:
             if warn:
                 print(a.yellow("⚠ " + warn))
                 print(a.dim("  (it applies after a CLI restart; ccroll never edits your settings)"))
-                time.sleep(2)
+                time.sleep(2)             # before the dashboard: time to read it
         tty_out = sys.stdout.isatty()
         printed = None
         if tty_out:
             sys.stdout.write("\033[?1049h\033[?25l")
             sys.stdout.flush()
+        UI_THREAD = threading.current_thread()
+        SIGNAL_WRITER = SignalWriter()
         try:
             with Keyboard() as kb:
-                running = True
-                while running:
-                    if self.proc is None and now() >= self.next_try:
+                while True:
+                    self.drain()
+                    if self.quitting and not self.quit_waits():
+                        break
+                    if self.proc is None and now() >= self.next_try and not self.quitting:
                         self.connect()
                     self.watch_live()
                     size = shutil.get_terminal_size()
@@ -4347,9 +5524,13 @@ class Client:
                         if (line, self.frame_t) != printed:
                             printed = (line, self.frame_t)
                             print(f"{fmt_clock(now())} {line}", flush=True)
-                    key = self.pump(1.0, kb)
+                    key = self.pump(self.tick(), kb)
                     if key in ("q", "\x03"):
-                        running = False
+                        if self.quitting:
+                            break                 # asked twice: now
+                        self.quitting = True
+                        if self.quit_waits():
+                            self.notice = f"quitting once {self.quit_waits()} — press q again to quit now"
                     elif key == "r":
                         if self.linked:
                             self.send({"type": "rotate"})
@@ -4364,6 +5545,11 @@ class Client:
                 with contextlib.suppress(OSError):
                     self.proc.kill()
             self.save()
+            writer, SIGNAL_WRITER, UI_THREAD = SIGNAL_WRITER, None, None
+            writer.close()
+            for fd in (self.wake_r, self.wake_w):
+                with contextlib.suppress(OSError):
+                    os.close(fd)
             for line in self.said:
                 print(line)
         return 0
@@ -4525,6 +5711,9 @@ def cmd_release(cfg: Cfg, a: Ansi, host: str, yes: bool) -> int:
         reply = msgs[0] if msgs else {"ok": False, "msg": "the master did not answer"}
         print((a.green("✓ ") if reply.get("ok") else a.red("✗ ")) + str(reply.get("msg")))
         return 0 if reply.get("ok") else 1
+    state = load_state(cfg)                # afresh: the prompt may have waited a while
+    lane = (state.get("lanes") or {}).get(host)
+    held = (lane or {}).get("active") or ((lane or {}).get("pending") or {}).get("to")
     if lane is None:
         raise CcrollError(f"no client host {host!r} is known in {cfg.state_path}")
     state["lanes"].pop(host, None)
@@ -4538,10 +5727,106 @@ def cmd_release(cfg: Cfg, a: Ansi, host: str, yes: bool) -> int:
 LOGIN_HELP = """\
 Claude Code will now open with a fresh, isolated profile.
   1. Complete the login it offers (choose the Claude subscription account).
-  2. When the normal prompt appears, quit immediately: /exit (or Ctrl+C twice).
+  2. When the normal prompt appears, quit: /exit (or Ctrl+C twice).
+     Do NOT use /logout — it revokes the login on the server, not just here.
 Nothing you do in that window affects your real sessions.  The account is
 named by its own email address, read from the account after login.
 """
+
+# Environment a parent Claude Code session (or the shell) can carry that would
+# make the login child authenticate or store its login somewhere other than
+# its own fresh profile: token / API-key variables, the session-sharing and
+# background-session markers, gateway and custom OAuth endpoints.
+_LOGIN_ENV_DROP_PREFIXES = ("CLAUDE_CODE_", "ANTHROPIC_", "CLAUDE_BG_", "CCR_")
+_LOGIN_ENV_DROP = {"CLAUDECODE", "CLAUDE_PID", "CLAUDE_JOB_DIR", "CLAUDE_EFFORT"}
+
+
+def _login_env(profile_dir: str) -> dict:
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith(_LOGIN_ENV_DROP_PREFIXES) and k not in _LOGIN_ENV_DROP}
+    env["CLAUDE_CONFIG_DIR"] = profile_dir
+    return env
+
+
+class _LoginWatch(threading.Thread):
+    """Keeps the newest login the child writes into its profile while it
+    runs.  Claude Code stores the login in <profile>/.credentials.json (plain
+    file on Linux) and its identity in <profile>/.claude.json; /logout deletes
+    both before the child exits, so reading them only afterwards loses a
+    login that did complete."""
+
+    def __init__(self, profile_dir: str):
+        super().__init__(daemon=True)
+        self.cred_path = os.path.join(profile_dir, CRED_FILE)
+        self.conf_path = os.path.join(profile_dir, CONFIG_FILE)
+        self.done = threading.Event()
+        self.creds: dict | None = None      # last valid credentials seen
+        self.account: dict | None = None     # oauthAccount seen alongside them
+        self.gone = False                   # they were there, then removed
+
+    def poll(self) -> None:
+        creds = read_json(self.cred_path)
+        if oauth_of(creds):
+            self.creds, self.gone = creds, False
+            ident = (read_json(self.conf_path) or {}).get("oauthAccount")
+            if isinstance(ident, dict):
+                self.account = ident
+        elif self.creds is not None and not os.path.exists(self.cred_path):
+            self.gone = True
+
+    def run(self) -> None:
+        while not self.done.wait(0.25):
+            self.poll()
+
+    def finish(self) -> None:
+        self.done.set()
+        self.join()
+        self.poll()
+
+
+def _record(cfg: Cfg, text: str, email: str | None = None, live: bool = False) -> str | None:
+    """Log `text` (and file `email` in state["emails"]; with `live`, also
+    mark it this machine's live login) where it will stick: through the
+    running master, which owns state.json and rewrites it from memory, else
+    into a freshly read state.json.  Returns the master's objection, if it
+    had one."""
+    try:
+        s = unix_connect(master_sock_path(cfg))
+    except OSError:
+        s = None
+    if s is not None:
+        with s:
+            s.sendall(frame_msg({"type": "note", "event": text, "email": email,
+                                 "live": email if live else None}))
+            buf = b""
+            s.settimeout(10)
+            with contextlib.suppress(OSError):
+                while b"\n" not in buf:
+                    data = s.recv(65536)
+                    if not data:
+                        break
+                    buf += data
+        msgs, _ = _parse_lines(buf)
+        if msgs and msgs[0].get("type") == "noted":
+            return None if msgs[0].get("ok") else str(msgs[0].get("msg"))
+    state = load_state(cfg)
+    if email:
+        state["emails"][email] = email
+        if live:
+            state["active"] = email
+    add_event(state, text)
+    save_state(cfg, state)
+    return None
+
+
+def _keep_or_drop(tmp: str, a: Ansi) -> None:
+    """A failed login's profile is left for inspection when the CLI wrote
+    anything into it beyond the seed config; an untouched one is removed.
+    Dot-named, so no account listing ever picks it up."""
+    if set(os.listdir(tmp)) - {CONFIG_FILE}:
+        print(a.dim(f"  its profile is kept for inspection: {tmp} (delete it when done)"))
+    else:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def _email_of_creds(oauth: dict, retries: int = 3) -> str | None:
@@ -4554,8 +5839,8 @@ def _email_of_creds(oauth: dict, retries: int = 3) -> str | None:
     return None
 
 
-def login_email(oauth: dict, profile_dir: str) -> tuple[str | None, str | None]:
-    """(email, note) for a login just completed in `profile_dir`.
+def login_email(oauth: dict, ident: dict | None) -> tuple[str | None, str | None]:
+    """(email, note) for a login just completed.
 
     The account's own profile endpoint is asked first.  When it does not
     answer — it shares the per-account limiter with the usage endpoint, so a
@@ -4566,25 +5851,65 @@ def login_email(oauth: dict, profile_dir: str) -> tuple[str | None, str | None]:
     email = _email_of_creds(oauth)
     if email:
         return email, None
-    ident = (read_json(os.path.join(profile_dir, CONFIG_FILE)) or {}).get("oauthAccount") or {}
     email = ident.get("emailAddress") if isinstance(ident, dict) else None
     if isinstance(email, str) and "@" in email:
         return email, "profile endpoint did not answer; named from the login's stored identity"
     return None, None
 
 
-def _register(cfg: Cfg, state: dict, email: str, creds: dict) -> None:
+def _register(cfg: Cfg, state: dict | None, email: str, creds: dict) -> None:
     """File credentials under the account's email (the enforced identity)."""
     if not NAME_RE.match(email):
         raise CcrollError(f"account email {email!r} is not usable as a directory name")
     d = os.path.join(cfg.root, email)
     os.makedirs(d, mode=0o700, exist_ok=True)
-    write_json_atomic(os.path.join(d, CRED_FILE), creds)
-    state["emails"][email] = email
+    path = os.path.join(d, CRED_FILE)
+    with cred_lock(path):
+        write_json_atomic(path, creds)
+    if state is not None:
+        state["emails"][email] = email
+
+
+def _capture_login(cfg: Cfg, a: Ansi, claude_bin: str, tmp: str) -> tuple[dict | None, dict | None]:
+    """Run the login child on `tmp`; (credentials, identity), or (None, None)
+    with the reason printed and logged."""
+    cred_path = os.path.join(tmp, CRED_FILE)
+    watch = _LoginWatch(tmp)
+    watch.start()
+    try:
+        subprocess.run([claude_bin], env=_login_env(tmp))
+    finally:
+        watch.finish()
+    creds, ident = watch.creds, watch.account
+    if creds is None:
+        print(a.red(f"✗ no login was ever written to {cred_path} — login not completed?"))
+        _record(cfg, "add: login discarded — no credentials stored")
+        return None, None
+    if not watch.gone:
+        return creds, ident
+    # /logout ran after the login: Claude Code revokes the refresh token on
+    # the server as it deletes the file, so the snapshot is only good if that
+    # revoke did not go through.  A refresh answers which; its result is the
+    # token to keep (the old refresh token may rotate away with it).
+    try:
+        creds = dict(creds, claudeAiOauth=oauth_refresh(oauth_of(creds)))
+    except Throttled as e:
+        # no answer either way: keeping a login that may be revoked costs a
+        # re-add later; discarding one that is good costs it now
+        print(a.yellow("⚠ /logout removed the login, and whether it revoked it could not be "
+                       f"checked ({e}) — kept it; re-add it if its reads fail with auth"))
+        return creds, ident
+    except CcrollError as e:
+        print(a.red("✗ the login was revoked by /logout — run `ccroll add` again, log in, "
+                    "and quit with /exit, not /logout"))
+        print(a.dim(f"  (checked by refreshing the captured login: {e})"))
+        _record(cfg, "add: login discarded — revoked by /logout")
+        return None, None
+    print(a.yellow("⚠ /logout removed the login, but it still refreshes — kept it"))
+    return creds, ident
 
 
 def cmd_add(cfg: Cfg, a: Ansi) -> int:
-    state = load_state(cfg)
     claude_bin = shutil.which("claude")
     if not claude_bin:
         raise CcrollError("`claude` not found on PATH")
@@ -4593,53 +5918,46 @@ def cmd_add(cfg: Cfg, a: Ansi) -> int:
         # log in into a temp profile first — the account's email, read from the
         # account itself, then becomes the name (no chance of mislabeling)
         tmp = tempfile.mkdtemp(prefix=".login-", dir=cfg.root)
-        write_json_atomic(os.path.join(tmp, ".claude.json"), {"hasCompletedOnboarding": True})
+        write_json_atomic(os.path.join(tmp, CONFIG_FILE), {"hasCompletedOnboarding": True})
         print(a.bold("── add account ") + a.dim("─" * 45))
         print(LOGIN_HELP)
-        env = dict(os.environ, CLAUDE_CONFIG_DIR=tmp)
-        env.pop("CLAUDE_CODE_OAUTH_TOKEN", None)  # must not shadow the file login
-        subprocess.run([claude_bin], env=env)
-        creds = read_json(os.path.join(tmp, CRED_FILE))
+        creds, ident = _capture_login(cfg, a, claude_bin, tmp)
         oauth = oauth_of(creds)
         if not oauth:
-            shutil.rmtree(tmp, ignore_errors=True)
-            add_event(state, "add: login discarded — no credentials stored")
-            save_state(cfg, state)
-            print(a.red("✗ no credentials were stored — login not completed?"))
+            _keep_or_drop(tmp, a)
         else:
             if "user:profile" not in (oauth.get("scopes") or []):
                 print(a.yellow("⚠ token lacks user:profile scope (console login?) — "
                                "usage cannot be read; use the Claude-account login instead"))
-            email, note = login_email(oauth, tmp)
+            email, note = login_email(oauth, ident)
             if note:
                 print(a.yellow(f"⚠ {note}"))
             if not email:
-                shutil.rmtree(tmp, ignore_errors=True)
-                add_event(state, "add: login discarded — account email unreadable")
-                save_state(cfg, state)
                 print(a.red("✗ could not read the account's email (network?) — nothing saved, try again"))
+                _record(cfg, "add: login discarded — account email unreadable")
+                _keep_or_drop(tmp, a)
             else:
                 dest = os.path.join(cfg.root, email)
                 if os.path.isdir(dest):
-                    _register(cfg, state, email, creds)
+                    _register(cfg, None, email, creds)
                     # the temp profile is about to go: keep its identity, or the
                     # account can never be identity-synced on a swap
-                    warn = store_identity(
-                        cfg, email,
-                        (read_json(os.path.join(tmp, CONFIG_FILE)) or {}).get("oauthAccount"))
+                    warn = store_identity(cfg, email, ident)
                     shutil.rmtree(tmp, ignore_errors=True)
                     print(a.green(f"↻ {email} — credentials updated (account already existed)"))
                     if warn:
                         print(a.yellow(f"⚠ {warn}"))
+                    _record(cfg, f"account re-logged in: {email}", email)
                 else:
                     if not NAME_RE.match(email):
-                        shutil.rmtree(tmp, ignore_errors=True)
+                        _keep_or_drop(tmp, a)
                         raise CcrollError(f"account email {email!r} is not usable as a directory name")
+                    # the captured login, not whatever the profile holds now
+                    # (a /logout may have emptied it)
+                    write_json_atomic(os.path.join(tmp, CRED_FILE), creds)
                     os.rename(tmp, dest)
-                    state["emails"][email] = email
                     print(a.green(f"✓ {email} added"))
-                add_event(state, f"account added: {email}")
-                save_state(cfg, state)
+                    _record(cfg, f"account added: {email}", email)
         try:
             again = input("Add another account? [y/N] ").strip().lower()
         except EOFError:
@@ -4652,7 +5970,6 @@ def cmd_add(cfg: Cfg, a: Ansi) -> int:
 
 
 def cmd_adopt(cfg: Cfg, a: Ansi) -> int:
-    state = load_state(cfg)
     live = read_json(cfg.live_path)
     oauth = oauth_of(live)
     if not oauth:
@@ -4660,7 +5977,7 @@ def cmd_adopt(cfg: Cfg, a: Ansi) -> int:
     email = _email_of_creds(oauth)
     if not email:
         raise CcrollError("could not read the live account's email — check network and retry")
-    _register(cfg, state, email, live)
+    _register(cfg, None, email, live)
     # the live config names the account that logged in, which after a swap is
     # not necessarily the one these credentials belong to — copy it only when
     # the two agree
@@ -4672,9 +5989,11 @@ def cmd_adopt(cfg: Cfg, a: Ansi) -> int:
                 f"re-run `ccroll add` for it to enable --sync-identity")
     else:
         warn = store_identity(cfg, email, ident)
-    state["active"] = email
-    add_event(state, f"adopted live login: {email}")
-    save_state(cfg, state)
+    # through the master when one runs: it owns state.json (see `_record`)
+    objection = _record(cfg, f"adopted live login: {email}", email, live=True)
+    if objection:
+        print(a.yellow(f"✓ live login saved as {email}, but not marked active: {objection}"))
+        return 1
     print(a.green(f"✓ live login saved as {email} and marked active"))
     if warn:
         print(a.yellow(f"⚠ {warn}"))
