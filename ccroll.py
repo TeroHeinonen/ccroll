@@ -831,6 +831,22 @@ READING_FIELDS = ("session_pct", "session_reset", "weekly_pct", "weekly_reset",
                   "scoped_pct", "scoped_reset", "scoped_label", "status", "fetched_at")
 
 
+def has_reading(u: "Usage | None") -> bool:
+    """A good read: no error, and a session or all-models weekly figure.
+    An account with no 5-hour window (the reading simply has none) is as
+    readable as any other — it is the weekly limits that bind it."""
+    return u is not None and not u.error and (u.session_pct is not None or u.weekly_pct is not None)
+
+
+def burn_key(u: Usage, cfg: Cfg) -> str:
+    """The window whose fit paces this account: the session's, or, when the
+    reading has no session window, the weekly one that governs rotation
+    (all-models when the account has no scoped window)."""
+    if u.session_pct is not None:
+        return "session"
+    return "scoped" if cfg.mode == "scoped" and u.scoped_pct is not None else "weekly"
+
+
 def reading_blob(u: Usage) -> dict:
     """A good reading as state.json keeps it: the figures, resets and when
     it was taken — everything a restart needs to go on projecting it."""
@@ -1461,7 +1477,9 @@ def measure_preload(state: dict, usages: dict, cfg: Cfg) -> bool:
     if u is None or u.error:
         return False
     t = now()
-    fit = burn_fit(burn_series(state, name, "session"))
+    # an account without a session window would never grow a session fit;
+    # wait on the window that paces it instead
+    fit = burn_fit(burn_series(state, name, burn_key(u, cfg)))
     if fit is None and t < state.get("grace_until", 0) + PRELOAD_MEASURE_MAX_S:
         return False                      # give the post-grace fit a chance to settle
     elapsed_h = (t - snap["t"]) / 3600.0
@@ -1536,15 +1554,17 @@ def fleet_forecast(state: dict, name: str, u: Usage, cfg: Cfg, n_accounts: int) 
     if not fits:
         return None
     provisional = any(span < BURN_SETTLED_SPAN_S for _, span in fits.values())
+    govern = "weekly" if cfg.mode == "weekly" else "scoped"
     est = preload_estimate(state) or {}
-    measured = bool(est) and est.get("session") is not None
+    # swaps between accounts without a session window measure no session
+    # preload; the governing window's is then what the handover costs
+    measured = bool(est) and (est.get("session") is not None or est.get(govern) is not None)
     pre = {k: (est.get(k) or 0.0) for k in ("session", "weekly", "scoped")}
 
     def rate(key):
         r = fits.get(key)
         return None if r is None or r[0] < BURN_MIN_RATE else r[0]
 
-    govern = "weekly" if cfg.mode == "weekly" else "scoped"
     govern_thr = cfg.weekly_threshold if cfg.mode == "weekly" else cfg.scoped_threshold
     cycle_h, kind = None, "idle"
     sr = rate("session")
@@ -1640,7 +1660,7 @@ def fleet_runway(fc: dict, usages: dict, cfg: Cfg, t: float | None = None) -> di
     only the weekly windows can run the fleet dry."""
     t = now() if t is None else t
     accts = [(n, u) for n, u in usages.items()
-             if n != LIVE_PSEUDO and u and not u.error and u.session_pct is not None]
+             if n != LIVE_PSEUDO and has_reading(u)]
     if not accts:
         return None
     out = {"windows": {}}
@@ -1876,7 +1896,10 @@ def signal_guard(state: dict, what: str):
 
 def signal_switch_done(cfg: Cfg, state: dict, name: str, session_reset: float | None) -> None:
     """Sent once, immediately after the new account is live.  The reset is the
-    new account's 5-hour session window; null when it has not opened yet."""
+    new account's 5-hour session window; null when it has not opened yet.
+    An account with no session window at all sends null too, and keeps it:
+    sessions already read null as "no session reset to wait for", which is
+    exactly so, and a weekly reset in that field would read as a session's."""
     label = signal_label(state, name)
     resets = _utc(session_reset) if session_reset and session_reset > now() else None
     signal_write(cfg, state, "switch_done", {"account": label, "window_resets_utc": resets},
@@ -2461,8 +2484,7 @@ def candidates(usages: dict, cfg: Cfg, exclude: str | None,
     and, when the preload is known, of what the swap itself will cost."""
     ok = [(n, u) for n, u in usages.items()
           if n != exclude and n != LIVE_PSEUDO
-          and u and not u.error and u.session_pct is not None
-          and not is_exhausted(u, cfg, t)]
+          and has_reading(u) and not is_exhausted(u, cfg, t)]
     strict = [(n, u) for n, u in ok if comfortable(u, cfg, preload, t)]
     return strict, ok
 
@@ -2485,7 +2507,7 @@ def comfortable(u: Usage, cfg: Cfg, preload: dict | None = None,
         return False
     if preload:
         need_s = preload.get("session")
-        if need_s is not None and 100 - sess <= 1.2 * need_s + 5:
+        if need_s is not None and u.session_pct is not None and 100 - sess <= 1.2 * need_s + 5:
             return False
         gov_pct = week if cfg.mode == "weekly" else scoped
         need_g = preload_cost(preload, cfg)
@@ -2595,8 +2617,8 @@ def target_reason(u: Usage, cfg: Cfg, label: str) -> str:
     rate = perish_rate(pct, reset)
     if rate is None:
         return f"{name} window not open — fresh week starts on use"
-    return (f"{100 - (pct or 0):.0f}% {name} headroom expires in {fmt_dur(reset - now())} "
-            f"· {u.session_pct or 0:.0f}% session")
+    return (f"{100 - (pct or 0):.0f}% {name} headroom expires in {fmt_dur(reset - now())}"
+            + (f" · {u.session_pct:.0f}% session" if u.session_pct is not None else ""))
 
 
 def verified_target(cfg: Cfg, usages: dict, active: str | None,
@@ -2777,8 +2799,11 @@ def render_table(a: Ansi, rows: list, scoped_label: str) -> list[str]:
                 cur = getattr(u, f"{key}_pct")
                 return bool(u.stale_note) and raw is not None and cur is not None \
                     and round(cur) != round(raw)
-            row = [mark, label,
-                   _pct_cell(a, u.session_pct, u.session_reset, est("session")),
+            # a good read without a session window: no 5-hour limit at all,
+            # unlike `↺—`, a session window that is there but not opened
+            sess = ((a.dim("none"), 4) if has_reading(u) and u.session_pct is None
+                    else _pct_cell(a, u.session_pct, u.session_reset, est("session")))
+            row = [mark, label, sess,
                    _pct_cell(a, u.weekly_pct, u.weekly_reset, est("weekly")),
                    _pct_cell(a, u.scoped_pct, u.scoped_reset, est("scoped")),
                    _status_cell(a, u)]
@@ -3626,7 +3651,7 @@ class Master:
                 if pts:
                     setattr(u, f"{key}_pct", pts[-1][1])
                     newest = max(newest or 0.0, pts[-1][0])
-            if newest is not None and u.session_pct is not None:
+            if newest is not None and has_reading(u):
                 u.fetched_at, u.stale_note = newest, "from last run"
                 self.seed_view[name] = u
 
@@ -3814,7 +3839,7 @@ class Master:
         """Keep each account's newest good reading — in memory for the
         blackout rules, and in state.json for the next run (`seed`)."""
         for name, u in fresh.items():
-            if u is not None and not u.error and u.session_pct is not None:
+            if has_reading(u):
                 self.last_good[name] = u
                 if name != LIVE_PSEUDO:
                     self.state["readings"][name] = reading_blob(u)
@@ -3824,7 +3849,7 @@ class Master:
         and its current one: a reading exists from the swap moment on, and
         if every poll after the swap fails, that is what rotation projects
         (at the lane's burn until the account has a fit of its own)."""
-        if snapshot is None or snapshot.error or snapshot.session_pct is None:
+        if not has_reading(snapshot):
             return
         cur = self.last_good.get(target)
         if cur is None or snapshot.fetched_at >= cur.fetched_at:
@@ -4769,7 +4794,7 @@ class Master:
                     lim = (f"{label} in ≈" + dur, len(label) + 5 + dlen)
                 elif in_grace(ls):
                     lim = (a.dim("post-swap grace"), 15)
-                rate = active_burn(ls, name, "session")
+                rate = active_burn(ls, name, burn_key(u, cfg))
                 if rate is not None:
                     text = f"{rate:.1f}%/h" if rate >= BURN_MIN_RATE else "idle"
                     burn = (text, len(text))
@@ -5036,7 +5061,8 @@ class Master:
             return
         self.printed = (u.fetched_at, notice)
         if not u.error:
-            print(f"{fmt_clock(now())} active={act} session={u.session_pct or 0:.0f}% "
+            sess = "—" if u.session_pct is None else f"{u.session_pct:.0f}%"
+            print(f"{fmt_clock(now())} active={act} session={sess} "
                   f"weekly={u.weekly_pct or 0:.0f}% scoped={u.scoped_pct or 0:.0f}%"
                   + (f" · {notice}" if notice else ""), flush=True)
         else:
