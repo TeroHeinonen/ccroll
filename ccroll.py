@@ -101,6 +101,7 @@ FRESH_PERISH_RATE = 97 / 168    # %/h an unopened weekly window "loses" by not s
                                 # its 7-day clock: one full window per week
 TOUCH_REASON = "opens a fresh"  # prefix of the reason a --touch move carries
 REFRESH_MARGIN_S = 180          # refresh an access token this close to expiry
+LOGIN_WARN_S = 3 * 86400        # the dashboard lists logins whose refresh token ends this soon
 SWAP_VERIFY_DELAY_S = 2.0       # re-check the live file this long after a swap
 SAMPLE_RETENTION_S = 24 * 3600  # keep at most a day of burn-rate samples
 BURN_WINDOW_S = 45 * 60         # fit burn rate over the last 45 minutes
@@ -532,6 +533,18 @@ def list_accounts(cfg: Cfg) -> list[Account]:
             if os.path.isfile(os.path.join(d, CRED_FILE)):
                 accounts.append(Account(name, d))
     return accounts
+
+
+def login_ends(accounts: list[Account]) -> dict[str, float]:
+    """account -> when its login lapses: the refresh token's own expiry.
+    A refresh renews the access token but never this deadline, which is
+    fixed at login (about 30 days on); only a re-login moves it."""
+    out = {}
+    for acc in accounts:
+        ms = (oauth_of(acc.read()) or {}).get("refreshTokenExpiresAt")
+        if isinstance(ms, (int, float)):
+            out[acc.name] = ms / 1000.0
+    return out
 
 
 def get_account(cfg: Cfg, name: str) -> Account:
@@ -3551,6 +3564,7 @@ class Master:
         self.cfg, self.a = cfg, a
         self.state = load_state(cfg)
         self.accounts = list_accounts(cfg)
+        self.login_ends: dict[str, float] = {}   # account -> refresh-token expiry, read by the scan
         self.usages: dict[str, Usage] = {}
         self.last_good: dict[str, Usage] = {}   # newest error-free read per account
         self.seed_view: dict[str, Usage] = {}   # last run's samples, shown until a read lands
@@ -3837,6 +3851,7 @@ class Master:
             self.usages.pop(gone, None)
             self.last_good.pop(gone, None)
             self.state["readings"].pop(gone, None)
+        self.submit("logins", "", login_ends, list(self.accounts), then=self.on_login_ends)
         live = self.live_names()
         todo = [acc for acc in self.accounts if acc.name not in live]
         held = set(self.holdings(self.local)) | set(self.claims)
@@ -3857,6 +3872,11 @@ class Master:
         self.usages[name] = u
         self.remember_good({name: u})
         record_samples(self.state, {name: u})
+
+    def on_login_ends(self, v, e) -> None:
+        if e is not None:
+            raise e
+        self.login_ends = v
 
     def on_scan_done(self, _v, e) -> None:
         self.scan_prog = None
@@ -4831,6 +4851,13 @@ class Master:
         if target:
             lines += ["", a.dim("next in line: ") + a.green(target)
                       + a.dim(f"  ({target_reason(pool[target], cfg, label)})")]
+        lapsing = sorted((t, n) for n, t in self.login_ends.items() if t - now() < LOGIN_WARN_S)
+        if lapsing:
+            lines += ["", a.red(f"⚠ {len(lapsing)} login{'s' if len(lapsing) > 1 else ''} "
+                              f"expire within {LOGIN_WARN_S / 86400:g}d — renew with `ccroll add`")]
+            cells = [f"{n} {'EXPIRED' if t <= now() else fmt_dur(t - now())}" for t, n in lapsing]
+            for i in range(0, len(cells), 3):
+                lines.append(a.yellow("  " + "  ·  ".join(cells[i:i + 3])))
         if viewer.notice:
             lines += ["", a.yellow(viewer.notice)]
         events = self.state.get("events", [])[-(6 if fleet else 4):]
@@ -4850,7 +4877,7 @@ class Master:
         parts = []
         if self.scan_prog:
             parts.append(f"scanning {self.scan_prog[0]} accounts · {self.scan_prog[1]} read")
-        parts += [f"{what}…" for key, what in self.tasks.items() if key != "scan"]
+        parts += [f"{what}…" for key, what in self.tasks.items() if what and key != "scan"]
         return "  ·  ".join(parts)
 
     # --- the loop ------------------------------------------------------------

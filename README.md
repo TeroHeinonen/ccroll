@@ -151,6 +151,8 @@ Tuning: `--threshold`, `--scoped-threshold`, `--weekly-threshold` (all-models we
 
 ## Burn estimates
 
+**Logins lapse; refreshes don't renew them.** ccroll's refreshes keep every access token fresh, but each login's refresh token has its own fixed deadline, about 30 days after the login, and no refresh moves it. The dashboard lists every login within 3 days of it (the same warning Claude Code shows as "Your login expires in N days"). Renew one with `ccroll add`. That is safe even for the live account: the new login goes into the store, and the next swap to that account uses it. `ccroll list` shows every deadline.
+
 Every duration — resets, limit ETAs, token expiries — is shown in a fixed `0d 00h 00m` format with days, hours and minutes each in their own color (zero-value leading units dimmed), so remaining time reads in a single glance.
 
 Two reset cells read as words rather than a duration, and they mean different things. `↺—` is a window that was never opened: it sits at 0% and nothing is expiring. `↺rolled` is a window whose reset has already passed while the usage endpoint is still serving the old figure — the row shows the 0% ccroll is acting on rather than that stale reading, dimmed, because it is a deduction awaiting the next read rather than a measurement. It is never an unchecked one: whichever account gets picked is re-read in full before a swap commits. In the sample above the rolled account is ranked as a fresh window and loses to `qa@example.com`, whose 91% of headroom over six days perishes slightly faster than a stopped clock — the ordering the **Rotation policy** section explains.
