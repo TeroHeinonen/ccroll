@@ -2683,10 +2683,30 @@ def perish_rate(pct: float | None, reset: float | None, t: float | None = None) 
 
 
 def pick_target(usages: dict, cfg: Cfg, exclude: str | None, t: float | None = None,
-                preload: dict | None = None) -> str | None:
-    """The account whose governing weekly headroom is most perishable.
+                preload: dict | None = None, view: dict | None = None) -> str | None:
+    """The account to swap to: the one the lane will stay on.
 
-    Every account is ranked by one number: how fast its unused headroom is
+    There are two orderings, and which applies is decided by the same gates
+    pre-emption uses, so the target is never a stopover.
+
+    When pre-emption could act after the swap — `view` is the lane as
+    `preempt_target` will judge it once the grace is over (`landing_view`),
+    --preempt is on, and the measured preload is within --preempt-max-cost —
+    the order is pre-emption's own: among the comfortable (strict)
+    candidates, the open window with the earliest governing reset, once any
+    open candidate's runway on that view clears --preempt-runway.  That
+    earliest one need not clear it itself: pre-emption gates on the account
+    it leaves, so from any candidate with runway it would move on to the
+    earliest reset whatever that account's own runway — the earliest is
+    where the lane comes to rest.  An unopened window resets
+    a week after first use, later than any open one, so it comes last.
+    Picking by perish rate here would land the lane on an account that
+    `preempt_target` then leaves minutes later for the earliest reset,
+    paying a second preload for nothing (the Nov 1 double hops).
+
+    Otherwise — no view, --no-preempt, the preload too dear, or no open
+    candidate with runway — the order is the perish rate.  Every account is
+    ranked by one number: how fast its unused headroom is
     being lost, in % per hour.  For an open window that is headroom over
     hours until the reset, so the account that resets soonest with the most
     unused quota is drained first and distant resets are kept as reserve.
@@ -2710,6 +2730,18 @@ def pick_target(usages: dict, cfg: Cfg, exclude: str | None, t: float | None = N
 
     strict, ok = candidates(usages, cfg, exclude, preload, t)
     pool = strict or ok
+    if view is not None and cfg.preempt and strict:
+        cost = preload_cost(preload, cfg)
+        if cost is None or cost <= cfg.preempt_max_cost:
+            opened = []
+            for n, u in strict:
+                pct, reset = governing_window(u, cfg)
+                if perish_rate(pct, reset, t) is None:
+                    continue                 # unopened: resets a week after first use
+                runway = runway_s(dict(view, active=n), n, u, cfg)
+                opened.append((reset, n, runway is not None and runway > cfg.preempt_runway))
+            if any(r for _, _, r in opened):
+                return min(opened)[1]
     return min(pool, key=key)[0] if pool else None
 
 
@@ -2846,6 +2878,22 @@ def preempt_target(cfg: Cfg, state: dict, usages: dict, active: str,
                   f"up to {gain:.1f}% at stake for a {cost or 0:.0f}% swap")
 
 
+def landing_view(state: "dict | Lane", leaving: str | None, t: float | None = None) -> dict:
+    """The lane as preempt_target will judge it once a swap off `leaving`
+    has finished its grace: the new account has no fit of its own yet, so
+    it is paced at the burn the lane measured on `leaving` — exactly what
+    the real swap records (`record_lane_burn`).  A few dict reads and one
+    least-squares fit per window: cheap enough for every dashboard frame."""
+    t = now() if t is None else t
+    view = {"samples": state.get("samples", {}), "lane_burn": state.get("lane_burn"),
+            "preload": state.get("preload"), "touch_pending": state.get("touch_pending"),
+            "active": leaving, "grace_until": state.get("grace_until", 0)}
+    if leaving:
+        record_lane_burn(view, leaving)
+    view.update(samples={}, grace_until=t, active=None)
+    return view
+
+
 def target_reason(u: Usage, cfg: Cfg, label: str) -> str:
     """Why this account is next, for the dashboard."""
     pct, reset = governing_window(u, cfg)
@@ -2858,7 +2906,7 @@ def target_reason(u: Usage, cfg: Cfg, label: str) -> str:
 
 
 def verified_target(cfg: Cfg, usages: dict, active: str | None,
-                    preload: dict | None = None) -> str | None:
+                    preload: dict | None = None, view: dict | None = None) -> str | None:
     """pick_target, but with the choice confirmed against a fresh read before we
     commit to it.  Fleet data can be up to `--scan` seconds old, and an account
     may have been consumed elsewhere in that time; never swap onto one that is
@@ -2866,7 +2914,7 @@ def verified_target(cfg: Cfg, usages: dict, active: str | None,
     skip: set[str] = set()
     for _ in range(MAX_TARGET_TRIES):
         pool = {n: u for n, u in usages.items() if n not in skip}
-        target = pick_target(pool, cfg, exclude=active, preload=preload)
+        target = pick_target(pool, cfg, exclude=active, preload=preload, view=view)
         if not target:
             return None
         fresh = usage_for(get_account(cfg, target).cred_path, account=target)
@@ -3505,7 +3553,8 @@ def cmd_status(cfg: Cfg, a: Ansi) -> int:
                                  readable_accounts(accounts, usages), label, usages=usages):
             print(line)
     pool = {n: u for n, u in usages.items() if n not in held}
-    target = pick_target(pool, cfg, exclude=active, preload=preload_estimate(state))
+    target = pick_target(pool, cfg, exclude=active, preload=preload_estimate(state),
+                         view=landing_view(state, active))
     if target:
         u = usages[target]
         print()
@@ -4399,7 +4448,8 @@ class Master:
         active = ls.get("active")
         pool = self.pool(lr)
         self.submit(lr.key, f"choosing an account for {lr.host}", _verify_in, verified_target,
-                    self.cfg, pool, active, preload_estimate(ls), urgent=True,
+                    self.cfg, pool, active, preload_estimate(ls), landing_view(ls, active),
+                    urgent=True,
                     then=lambda v, e: self.on_target(lr, active, reason, auto, first, v, e))
 
     def on_target(self, lr: LaneRt, active: str | None, reason: str, auto: bool, first: bool,
@@ -5139,7 +5189,8 @@ class Master:
                 f"  {held}  ·  resumes at {fmt_local(cfg, hold[1])} "
                 f"(in {fmt_dur(hold[1] - now())}) or on [r]")]
         pool = self.pool(viewer)
-        target = pick_target(pool, cfg, exclude=active, preload=preload_estimate(ls))
+        target = pick_target(pool, cfg, exclude=active, preload=preload_estimate(ls),
+                             view=landing_view(ls, active))
         if target:
             lines += ["", a.dim("next in line: ") + a.green(target)
                       + a.dim(f"  ({target_reason(pool[target], cfg, label)})")]
