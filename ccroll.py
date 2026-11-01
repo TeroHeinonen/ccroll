@@ -816,11 +816,13 @@ class Usage:
         self.status = None
         self.error = None
         self.retry_after = None     # seconds a 429 asked us to wait, when it said
+        self.held_until = None      # a read not sent: when the hold on it ends
         self.projected_from = None  # {session, weekly, scoped}: the raw reading, when projected
         self.projected_rate = None  # {key: %/h} the projection advanced each window by
         self.projected_age = None   # seconds between that reading and the projection
         self.projected_full = None  # when the projection has a window full: the moment it
                                     # filled, from which the account stops spending
+        self.projected_conservative = False  # projected blind: +rounding, at the peak burn
         self.fetched_at = now()
 
     def windows(self):
@@ -921,13 +923,20 @@ def fetch_usage(token: str) -> Usage:
 
 
 _usage_hold: dict[str, float] = {}   # hold key -> when a Retry-After lets us ask again
+_usage_wait: dict[str, float] = {}   # hold key -> length of the hold a refusal last set
+_usage_doubled: dict[str, bool] = {}  # hold key -> the current hold is a doubled one
 
 
-def _hold_key(cred_path: str) -> str:
-    """Whose limiter a Retry-After is about: the credentials in the file,
-    not the file.  The live file is every account in turn — a hold on the
-    one just rotated away from must not blind the next one for its
-    remaining minutes."""
+def _hold_key(cred_path: str, account: str | None = None) -> str:
+    """Whose limiter a Retry-After is about: the account, when the caller
+    knows it, else the credentials in the file — never the file.  The live
+    file is every account in turn, so a hold on the one just rotated away
+    from must not blind the next one for its remaining minutes; and the
+    account's tokens rotate whenever the running CLI refreshes them, so a
+    hold keyed by them alone is dropped by that refresh and the next poll
+    asks again long before the server said it may."""
+    if account and account != LIVE_PSEUDO:
+        return "account:" + account
     oauth = oauth_of(read_json(cred_path)) or {}
     return oauth.get("refreshToken") or oauth.get("accessToken") or cred_path
 
@@ -950,7 +959,7 @@ def held_token(cred_path: str) -> str:
     return oauth["accessToken"]
 
 
-def usage_for(cred_path: str, refresh: bool = True) -> Usage:
+def usage_for(cred_path: str, refresh: bool = True, account: str | None = None) -> Usage:
     """Fetch usage for stored credentials, refreshing the token when needed
     (including one retry when a supposedly-valid token turns out revoked).
     With refresh=False the stored token is used as it is and never renewed:
@@ -968,12 +977,19 @@ def usage_for(cred_path: str, refresh: bool = True) -> Usage:
     accounts just as dark.  So a throttled account is asked again at the
     normal cadence — never faster, and that cadence is what the endpoint
     accepts at idle — unless the 429 carried a Retry-After, which is
-    honoured to the second."""
-    key = _hold_key(cred_path)
+    honoured to the second.  Only a refusal of the first read after such a
+    hold doubles it (`_hold_after`): a limiter still closed when it said it
+    would open is one our asking keeps closed.  A held read sends nothing
+    and says when the hold ends (`held_until`), so the poll can land its
+    first read on that second rather than up to an interval later."""
+    key = _hold_key(cred_path, account)
     until = _usage_hold.get(key, 0.0)
     if now() < until:
         u = Usage()
-        u.error = f"rate_limit_error · server asked to wait {until - now():.0f}s"
+        u.error = (f"rate_limit_error · server asked to wait {until - now():.0f}s"
+                   if not _usage_doubled.get(key) else
+                   f"rate_limit_error · refused again, waiting {until - now():.0f}s")
+        u.held_until = until
         return u
     try:
         token = fresh_token(cred_path) if refresh else held_token(cred_path)
@@ -987,12 +1003,41 @@ def usage_for(cred_path: str, refresh: bool = True) -> Usage:
             u = fetch_usage(refresh_stored(cred_path, failed_access=token))
         except CcrollError as e:
             u = Usage(); u.error = str(e)
-    for k in {key, _hold_key(cred_path)}:     # the same account, refreshed or not meanwhile
-        if u.retry_after:
-            _usage_hold[k] = now() + u.retry_after
-        else:
-            _usage_hold.pop(k, None)
+    for k in {key, _hold_key(cred_path, account)}:   # the same account, refreshed or not meanwhile
+        _hold_after(k, u)
     return u
+
+
+def _hold_after(key: str, u: Usage) -> None:
+    """Set or clear `key`'s hold from the read that just came back.
+
+    A refusal with a Retry-After holds for exactly that long.  A refusal of
+    the first read after a hold means the limiter is still closed when it
+    said it would open — our asking is what it is still counting — so the
+    hold doubles from the last one (at least the server's new ask).  A
+    refusal with nothing to go on, and no hold before it, is asked again
+    at the normal cadence, as ever.  A good read clears everything; any
+    other failure says nothing about the limiter and leaves its record."""
+    if not u.error:
+        _usage_hold.pop(key, None)
+        _usage_wait.pop(key, None)
+        _usage_doubled.pop(key, None)
+        return
+    if not _rate_limited(u.error):
+        _usage_hold.pop(key, None)
+        return
+    prev = _usage_wait.get(key)
+    wait = u.retry_after or 0.0
+    doubled = bool(prev) and 2 * prev > wait
+    if doubled:
+        wait = 2 * prev
+    if wait > 0:
+        _usage_hold[key] = now() + wait
+        _usage_wait[key] = wait
+        _usage_doubled[key] = doubled
+        u.retry_after = wait
+    else:
+        _usage_hold.pop(key, None)
 
 
 def _find_email(obj):
@@ -1936,34 +1981,91 @@ def rotation_utilisation(u: "Usage | None", cfg: Cfg) -> float | None:
     return max(live) if live else None
 
 
+def rounded_up(u: Usage) -> Usage:
+    """`u` with every window at the top of its whole-percent step: the most
+    it can be.  The endpoint reports integers, so a 97 may be 97.99."""
+    out = copy.copy(u)
+    for key in ("session", "weekly", "scoped"):
+        pct = getattr(u, f"{key}_pct")
+        if pct is not None:
+            setattr(out, f"{key}_pct", min(100.0, pct + USAGE_PCT_STEP))
+    return out
+
+
 def maybe_signal_expected(cfg: Cfg, state: dict, name: str, u: "Usage | None",
                           rotating: bool, scheduled: float | None = None,
                           holding: bool = False) -> None:
     """Announce the coming switch once its predicted moment is about three
-    minutes out.  The burn prediction needs an estimate, so that part stays
-    quiet through the post-swap grace — and through a peak-hour hold, where
-    the account is meant to be spent and no burn-driven swap will follow;
-    `scheduled` is a moment ccroll already knows it will swap at (the hold
-    starting, re-parking, or ending), which needs no estimate.  Whichever
-    comes first is announced.  Stays quiet while rotation is paused."""
+    minutes out.  Called every tick with the usage rotation acts on (the
+    projected reading, or the conservative one when blind), so whatever
+    makes a swap fire — a fresh reading, a projection crossing, a blackout
+    margin — has announced it first.  The burn prediction needs an
+    estimate, so that part stays quiet through the post-swap grace — and
+    through a peak-hour hold, where the account is meant to be spent and no
+    burn-driven swap will follow; `scheduled` is a moment ccroll already
+    knows it will swap at (the hold starting, re-parking, or ending), which
+    needs no estimate.  Whichever comes first is announced.  Stays quiet
+    while rotation is paused.
+
+    A reading is a whole percent, so the swap can come as early as the
+    reading taken at the top of its step predicts (`rounded_up`): that
+    soonest moment decides *whether* to announce, and the ETA sent is the
+    reading's own prediction — the latest the swap can come at this burn,
+    and the moment the projection fires it if no fresher reading does.  A
+    swap at 97 → 98 one poll apart was otherwise announced in the same
+    second it happened.  A blind reading already carries that step.  Once
+    announced, a new line goes out only when the ETA moves outside what the
+    reading allows — earlier than its soonest or later than its own
+    prediction — by more than SIGNAL_ETA_DRIFT_S: the same prediction
+    re-made every tick is the same announcement, and a switch announced,
+    due and still due (every account spent, say) is not news either.  An
+    announcement that has passed with nothing due any more is forgotten, so
+    the next approach is announced afresh."""
     if not cfg.signal or not rotating or not name or name == LIVE_PSEUDO:
         return
-    eta_abs, pct = None, None
+    t = now()
+    cands = []                            # (soonest, eta to announce, usage_pct)
     if u is not None and not u.error and not in_grace(state) and not holding:
-        predicted = predicted_switch_eta(state, name, u, cfg)
-        if predicted is not None and predicted[0] <= SIGNAL_EXPECT_LEAD_S:
-            eta_abs, pct = now() + predicted[0], predicted[1]
-    if scheduled is not None and scheduled - now() <= SIGNAL_EXPECT_LEAD_S and (
-            eta_abs is None or scheduled < eta_abs):
-        eta_abs, pct = scheduled, rotation_utilisation(u, cfg) or 0.0
-    if eta_abs is None:
-        return
+        own = predicted_switch_eta(state, name, u, cfg)
+        soon = own if u.projected_conservative else \
+            predicted_switch_eta(state, name, rounded_up(u), cfg)
+        if soon is not None and soon[0] <= SIGNAL_EXPECT_LEAD_S:
+            eta, pct = own if own is not None else soon
+            cands.append((t + soon[0], t + eta, pct))
+    if scheduled is not None and scheduled - t <= SIGNAL_EXPECT_LEAD_S:
+        cands.append((scheduled, scheduled, rotation_utilisation(u, cfg) or 0.0))
     last = state.get("signal_expect_eta")
-    if last is not None and abs(eta_abs - last) <= SIGNAL_ETA_DRIFT_S:
+    if not cands:
+        if last is not None and last < t - SIGNAL_ETA_DRIFT_S:
+            state["signal_expect_eta"] = None     # it passed and nothing is due: the next approach is new
+        return
+    soonest, eta_abs, pct = min(cands, key=lambda c: c[1])
+    if last is not None and \
+            min(max(soonest, t), eta_abs) - SIGNAL_ETA_DRIFT_S <= last <= eta_abs + SIGNAL_ETA_DRIFT_S:
         return                            # same prediction, already announced
+    if last is not None and last <= t and eta_abs <= t + SIGNAL_ETA_DRIFT_S:
+        return                            # announced, due, and still due: e.g. no account to go to
     state["signal_expect_eta"] = eta_abs
     with signal_guard(state, "switch_expected"):
         signal_switch_expected(cfg, state, eta_abs, int(round(pct)))
+
+
+def signal_rotation_start(cfg: Cfg, state: dict, name: str, u: "Usage | None",
+                          rotating: bool) -> None:
+    """A rotation is starting now: make sure a switch_expected is out for
+    it.  Usually one already is (`maybe_signal_expected`); this covers the
+    swaps no prediction could see coming — a static threshold inside the
+    grace, a second host on the account, a status the endpoint reports — so
+    no automatic swap is unannounced.  Quiet while any announcement stands
+    (`maybe_signal_expected` forgets one only once nothing is due)."""
+    if not cfg.signal or not rotating or not name or name == LIVE_PSEUDO:
+        return
+    t = now()
+    if state.get("signal_expect_eta") is not None:
+        return
+    state["signal_expect_eta"] = t
+    with signal_guard(state, "switch_expected"):
+        signal_switch_expected(cfg, state, t, int(round(rotation_utilisation(u, cfg) or 0.0)))
 
 
 def maybe_signal_threshold(cfg: Cfg, state: dict, name: str, u: "Usage | None") -> None:
@@ -2054,11 +2156,17 @@ def window_spent(pct: float | None, reset: float | None, threshold: float,
 def pct_text(u: Usage, key: str, pct: float | None) -> str:
     """A window's utilisation as the rotation reason states it.  When the
     figure is a projection, say so and show what it was projected from:
-    `≈96% (91% read 6m ago + 80%/h)`."""
+    `≈96% (91% read 6m ago + 80%/h)`, or, blind,
+    `≈98% conservative (93% read 7m ago + 1% rounding + 35%/h peak)`."""
     if pct is None:
         return "—"
     raw = (u.projected_from or {}).get(key)
     rate = (u.projected_rate or {}).get(key)
+    if u.projected_conservative and raw is not None and round(pct) != round(raw):
+        # blind: say so, and show both margins it added
+        burn = f" + {rate:.0f}%/h peak" if rate is not None else ""
+        return (f"≈{pct:.0f}% conservative ({raw:.0f}% read "
+                f"{_fmt_eta_short(u.projected_age or 0)} ago + {USAGE_PCT_STEP:.0f}% rounding{burn})")
     if raw is None or rate is None or round(pct) == round(raw):
         return f"{pct:.0f}%"
     return (f"≈{pct:.0f}% ({raw:.0f}% read {_fmt_eta_short(u.projected_age or 0)} ago"
@@ -2133,7 +2241,7 @@ def verified_parking(cfg: Cfg, usages: dict, active: str | None) -> str | None:
         target = parking_target(pool, cfg, exclude=active)
         if not target:
             return None
-        fresh = usage_for(get_account(cfg, target).cred_path)
+        fresh = usage_for(get_account(cfg, target).cred_path, account=target)
         if not fresh.error:
             usages[target] = fresh
             if blocked_until(fresh, cfg, now() + cfg.lead) is not None:
@@ -2173,7 +2281,112 @@ def rotation_usage(last_good: dict, name: str, u: Usage | None) -> tuple[Usage |
     return snap, now() - snap.fetched_at
 
 
-def projected_usage(state: dict, name: str, u: Usage, t: float | None = None) -> Usage:
+def reading_blind(u: Usage | None, age: float | None, interval: float,
+                  t: float | None = None, polling: bool = False) -> bool:
+    """Is rotation judging the active account blind?  When the last read
+    attempt failed — refused, held by a Retry-After (a held read is a failed
+    one: nothing can land until the hold ends), or erred — `age` is set and
+    the answer is yes.  Otherwise only when the reading is older than the
+    interval *and* no poll for it is in flight (`polling`): a restart's kept
+    reading before its first poll goes out, a poll that never went out.
+
+    The age alone cannot say it.  A reading is stamped when its request is
+    made, before the pacer slot and the round trip, and the next poll goes
+    out an interval after the last one did; so a healthy lane's reading is
+    routinely older than the interval while the next poll waits for its
+    slot or its answer.  That poll ends in a good read or an error, within
+    HTTP_TIMEOUT_S, and the error is what makes the lane blind."""
+    if u is None:
+        return False
+    if age is not None:
+        return True
+    return not polling and (now() if t is None else t) - u.fetched_at > interval
+
+
+def rotation_view(state: dict, name: str, u: Usage, blind: bool,
+                  t: float | None = None) -> Usage:
+    """The active account's reading as rotation acts on it: projected at
+    the measured burn while reads land (`projected_usage`), conservatively
+    once blind (`conservative=True`) — the reading taken at the top of its
+    whole-percent step and advanced at the peak burn of this stint, so the
+    margin grows with every second nobody can see the account."""
+    return projected_usage(state, name, u, t, conservative=blind)
+
+
+def judge_rotation(state: dict, name: str, live: "Usage | None", last_good: dict,
+                   cfg: Cfg, t: float | None = None,
+                   polling: bool = False) -> tuple["Usage | None", str | None]:
+    """(the usage rotation acts on, the reason to rotate now or None) for a
+    lane's active account — every rule but the peak-hour hold and a second
+    host on the account, which the dashboard checks itself.  A failed read
+    falls back to the last good snapshot (`rotation_usage`) and is judged
+    blind (`reading_blind`), and the reason names the read error.
+    `polling`: a poll of the account is in flight, so an old reading is
+    about to be replaced rather than stale."""
+    u_act, age = rotation_usage(last_good, name, live)
+    if u_act is None:
+        return None, None
+    u_act = rotation_view(state, name, u_act,
+                          reading_blind(u_act, age, cfg.interval, t, polling), t)
+    reason = is_exhausted(u_act, cfg, t)
+    if reason is None:
+        reason = about_to_exhaust(state, name, u_act, cfg)
+    if reason and age is not None:
+        reason += f" · usage read: {live.error if live else 'unavailable'}"
+    return u_act, reason
+
+
+def settled_fit_rates(series: list) -> list:
+    """Every burn the 45-minute fit has shown over `series`, one per sample
+    (the fit as it stood when that sample landed), keeping only settled ones
+    — a span of at least BURN_SETTLED_SPAN_S, the same line the dashboard
+    draws between a fit and a provisional one: over a shorter span one
+    whole-percent step is most of the slope.  A sliding least-squares, so a
+    day of minute samples costs one pass."""
+    out = []
+    if len(series) < BURN_MIN_SAMPLES:
+        return out
+    t0 = series[0][0]
+    j = 0
+    st = sp = stt = stp = 0.0
+    for i, (ti, pi) in enumerate(series):
+        x = ti - t0
+        st += x; sp += pi; stt += x * x; stp += x * pi
+        while series[j][0] < ti - BURN_WINDOW_S:
+            xj, pj = series[j][0] - t0, series[j][1]
+            st -= xj; sp -= pj; stt -= xj * xj; stp -= xj * pj
+            j += 1
+        n = i - j + 1
+        span = ti - series[j][0]
+        if n < BURN_MIN_SAMPLES or span < max(BURN_MIN_SPAN_S, BURN_SETTLED_SPAN_S):
+            continue
+        denom = n * stt - st * st
+        if denom > 0:
+            out.append((n * stp - st * sp) / denom * 3600)
+    return out
+
+
+def peak_burn(state: dict, name: str, key: str) -> float | None:
+    """The burn to assume while blind: the highest this account has shown
+    since the swap onto it — every settled 45-minute fit over the stint's
+    series, and the rate the rules act on now (`active_burn`, which also
+    covers a burst its two last steps confirm, and the lane's pre-swap burn
+    until the account has a fit).  The series restarts at every swap, so
+    this is the same agents on the same account, and it needs no window of
+    its own: a burn they reached once in this stint they can resume unseen,
+    and one 45-minute fit is the shortest span the rules already trust.  In
+    the blackout that let an account reach 100% the fit when reads stopped
+    said 9%/h; the stint had run at 13%/h over its last 80 minutes and 35%/h
+    at its peak."""
+    rates = settled_fit_rates(burn_series(state, name, key))
+    cur = active_burn(state, name, key)
+    if cur is not None:
+        rates.append(cur)
+    return max(rates) if rates else None
+
+
+def projected_usage(state: dict, name: str, u: Usage, t: float | None = None,
+                    conservative: bool = False) -> Usage:
     """The active account's reading advanced to `t` at its measured burn.
 
     Every reading is a lower bound the moment it is taken: the agents keep
@@ -2205,6 +2418,13 @@ def projected_usage(state: dict, name: str, u: Usage, t: float | None = None) ->
     moment the swap lands would judge a new account by a cost it has not
     incurred yet, and move on before the agents had re-primed on it.
 
+    Blind (`conservative`, see `reading_blind`), the projection stops
+    assuming the reading was exact and the burn steady: each window starts
+    USAGE_PCT_STEP higher (the endpoint reports whole percents, so 93 can
+    be 93.99) and rises at the peak burn of this stint (`peak_burn`) rather
+    than the current estimate.  With reads landing it is never used, so
+    those decisions are exactly as before.
+
     The copy records the raw reading, the rate and the age so a reason or a
     dashboard line can show its working."""
     t = now() if t is None else t
@@ -2218,8 +2438,11 @@ def projected_usage(state: dict, name: str, u: Usage, t: float | None = None) ->
         pct, reset = getattr(u, f"{key}_pct"), getattr(u, f"{key}_reset")
         if pct is None:
             continue
-        rate = active_burn(state, name, key)
-        wins[key] = [0.0 if window_rolled(reset, f) else float(pct),
+        rate = (peak_burn if conservative else active_burn)(state, name, key)
+        level = 0.0 if window_rolled(reset, f) else float(pct)
+        if conservative and not window_rolled(reset, f):
+            level = min(100.0, level + USAGE_PCT_STEP)
+        wins[key] = [level,
                      reset if reset and reset > f else None,
                      rate if rate is not None and rate >= BURN_MIN_RATE else None]
     swapped = state.get("last_swap") or 0
@@ -2245,6 +2468,7 @@ def projected_usage(state: dict, name: str, u: Usage, t: float | None = None) ->
         out.projected_rate = rates
         out.projected_age = age
         out.projected_full = full_since
+        out.projected_conservative = conservative
     return out
 
 
@@ -2351,8 +2575,20 @@ def limit_etas(state: dict, name: str, u: Usage, cfg: Cfg) -> list:
             continue
         pct = effective_pct(pct, reset)
         rate, _, eta, _ = window_eta(state, name, key, pct)
+        if u.projected_conservative:
+            rate = acting_burn(state, name, key, u)
+            eta = eta_to_limit(pct, rate)
         out.append((key, label, pct, rate, eta))
     return out
+
+
+def acting_burn(state: dict, name: str, key: str, u: Usage) -> float | None:
+    """The burn a judgement of `u` assumes for `key`: the one its blind
+    projection is rising at, so a prediction made from it agrees with the
+    swap that projection will cause; otherwise the usual estimate."""
+    if u.projected_conservative:
+        return (u.projected_rate or {}).get(key)
+    return active_burn(state, name, key)
 
 
 def eta_to_threshold(pct: float | None, rate: float | None, threshold: float) -> float | None:
@@ -2375,7 +2611,7 @@ def threshold_etas(state: dict, name: str, u: Usage, cfg: Cfg) -> list:
         if pct is None:
             continue
         pct = effective_pct(pct, reset)
-        rate = active_burn(state, name, key)
+        rate = acting_burn(state, name, key, u)
         out.append((key, label, pct, rate, eta_to_threshold(pct, rate, thr)))
     return out
 
@@ -2633,7 +2869,7 @@ def verified_target(cfg: Cfg, usages: dict, active: str | None,
         target = pick_target(pool, cfg, exclude=active, preload=preload)
         if not target:
             return None
-        fresh = usage_for(get_account(cfg, target).cred_path)
+        fresh = usage_for(get_account(cfg, target).cred_path, account=target)
         if fresh.error:
             skip.add(target)          # unreadable now; try the next best
             continue
@@ -2697,14 +2933,16 @@ def earliest_recovery(usages: dict, cfg: Cfg, active: str | None = None,
     return moments[who], who
 
 
-def merged_view(usages: dict, last_good: dict, state=None) -> dict:
+def merged_view(usages: dict, last_good: dict, state=None,
+                interval: float | None = None, polling: "set | None" = None) -> dict:
     """Usages for display: an account whose read just failed keeps showing its
     last good numbers, with the error noted, rather than blanking its row.
     The active account is shown as rotation judges it — its last reading
     projected forward by its age — so a blackout shows the figure ccroll is
     acting on, not the one the endpoint last managed to serve.  `state` may
     be a list of lanes: each lane's active account is projected by its own
-    burn."""
+    burn — conservatively when blind (`reading_blind`, given the poll
+    `interval` and the accounts whose poll is in flight), as rotation does."""
     view = {}
     lanes = state if isinstance(state, list) else ([state] if state is not None else [])
     owner = {ls.get("active"): ls for ls in lanes if ls.get("active")}
@@ -2717,12 +2955,15 @@ def merged_view(usages: dict, last_good: dict, state=None) -> dict:
         # never shown as more than it is — and its age is on the row.
         # Rotation follows the same rule for the active account
         # (`rotation_usage`): no age limit, rolled windows dropped.
-        if u is not None and u.error and snap is not None:
+        failed = u is not None and u.error and snap is not None
+        if failed:
             shown = copy.copy(snap)
             shown.stale_note = u.error
         if name in owner and shown is not None and not shown.error:
             note = shown.stale_note
-            shown = projected_usage(owner[name], name, shown)
+            blind = interval is not None and reading_blind(shown, 0.0 if failed else None, interval,
+                                                           polling=name in (polling or ()))
+            shown = rotation_view(owner[name], name, shown, blind)
             shown.stale_note = note
         view[name] = shown
     return view
@@ -2880,7 +3121,9 @@ def render_burn(a: Ansi, state: dict, name: str, u: Usage | None, scoped_label: 
             cur = getattr(u, f"{key}_pct")
             if raw is None or rate is None or cur is None or round(cur) == round(raw):
                 continue
-            bits.append(f"{label} {raw:.0f}% read, ≈{cur:.0f}% projected at {rate:.0f}%/h")
+            how = (f"conservatively (+{USAGE_PCT_STEP:.0f}% rounding) at the {rate:.0f}%/h peak"
+                   if u.projected_conservative else f"at {rate:.0f}%/h")
+            bits.append(f"{label} {raw:.0f}% read, ≈{cur:.0f}% projected {how}")
         if bits:
             if u.projected_full is not None:
                 bits.append(f"refused since ≈{fmt_clock(u.projected_full)[:5]}, so no longer rising")
@@ -2993,8 +3236,8 @@ def scan_accounts(cfg: Cfg, accounts: list[Account], active: str | None,
     def one(acc: Account) -> tuple[str, Usage]:
         try:
             if acc.name == active:
-                return acc.name, usage_for(cfg.live_path)
-            return acc.name, usage_for(acc.cred_path, refresh=acc.name not in held)
+                return acc.name, usage_for(cfg.live_path, account=acc.name)
+            return acc.name, usage_for(acc.cred_path, refresh=acc.name not in held, account=acc.name)
         except Exception as e:            # noqa: BLE001 — one account's surprise is its own
             u = Usage()
             u.error = f"read failed: {e}"
@@ -3514,6 +3757,7 @@ class LaneRt:
         self.ls, self.cfg, self.local = ls, cfg, local
         self.notice = ""
         self.next_poll = 0.0
+        self.polling: float | None = None     # when the poll in flight went out, if one is
         self.conn: Conn | None = None
         self.pending_snapshot: Usage | None = None
         self.want_rotate: str | None = None   # an [r] that came while the lane was busy
@@ -3927,16 +4171,18 @@ class Master:
             if not oauth_of(read_json(cfg.live_path)):
                 return
             key = name or LIVE_PSEUDO
-            what, args = f"reading {key}", (cfg.live_path,)
+            what, args = f"reading {key}", (cfg.live_path, True, name)
         else:
             if not name:
                 return
             key = name
-            what, args = f"reading {key} ({lr.host})", (os.path.join(cfg.root, name, CRED_FILE), False)
-        self.submit(lr.key, what, usage_for, *args, urgent=True,
-                    then=lambda u, e: self.on_polled(lr, name, key, u, e))
+            what, args = f"reading {key} ({lr.host})", (os.path.join(cfg.root, name, CRED_FILE), False, name)
+        if self.submit(lr.key, what, usage_for, *args, urgent=True,
+                       then=lambda u, e: self.on_polled(lr, name, key, u, e)):
+            lr.polling = now()
 
     def on_polled(self, lr: LaneRt, name: str | None, key: str, u: "Usage | None", e) -> None:
+        lr.polling = None
         if e is not None:
             if not isinstance(e, Exception):
                 raise e
@@ -3944,6 +4190,10 @@ class Master:
             u.error = f"read failed: {e}"
         if lr.ls.get("active") != name:
             return                        # the lane moved while it was being read
+        if u.held_until is not None:
+            # nothing was sent: the first read the server allows goes out on
+            # the second its hold ends, not at whichever poll comes after it
+            lr.next_poll = min(lr.next_poll, u.held_until)
         self.usages[key] = u
         self.remember_good({key: u})
         self.take_reading(lr, name, u)
@@ -3961,10 +4211,28 @@ class Master:
                 return
             maybe_signal_threshold(lr.cfg, ls, name, u)
             maybe_signal_reset(lr.cfg, ls, name, u)
-            maybe_signal_expected(lr.cfg, ls, name, u, not self.paused,
-                                  scheduled=self.scheduled_swap(lr),
-                                  holding=bool(self.hold_window(lr)))
+            # switch_expected is not decided here but every tick, from what
+            # rotation acts on (`announce`), so a swap no reading triggers —
+            # a projection crossing, a blackout — is announced too
             save_state(cfg, self.state)
+
+    def announce(self, lr: LaneRt, active: str, u_act: "Usage | None",
+                 hold: "tuple | None", starting: bool = False) -> None:
+        """The account-switch announcements for this tick's judgement of the
+        lane's live account: the predicted or scheduled switch, and, when a
+        rotation starts now, the one it needs if nothing announced it.
+        state.json is saved only when an announcement went out."""
+        ls = lr.ls
+        if not lr.online() or not lr.cfg.signal:
+            return                        # nobody would receive them: they fire once it links again
+        before = ls.get("signal_expect_eta")
+        if starting:
+            signal_rotation_start(lr.cfg, ls, active, u_act, not self.paused)
+        else:
+            maybe_signal_expected(lr.cfg, ls, active, u_act, not self.paused,
+                                  scheduled=self.scheduled_swap(lr), holding=bool(hold))
+        if ls.get("signal_expect_eta") != before:
+            save_state(self.cfg, self.state)
 
     # --- peak-hour hold ------------------------------------------------------
     def hold_window(self, lr: LaneRt) -> tuple[float, float] | None:
@@ -4091,19 +4359,20 @@ class Master:
             if not lr.local and ls.get("bare"):
                 self.assign(lr)           # a client with no login at all: give it one
             return
-        if now() - ls.get("last_swap", 0) < cfg.cooldown:
-            return
-        live = self.usages.get(active)
         # A read that fails is what a throttled account does; fall back to the
         # last good snapshot rather than sitting on an account we cannot see.
-        # Either way the reading is projected forward by its age at the
-        # measured burn: what was read is a lower bound on where the account
-        # is now, and this runs every tick, so the swap fires at the predicted
-        # moment rather than at whichever poll happens to land after it.
-        u_act, age = rotation_usage(self.last_good, active, live)
-        if u_act is not None:
-            u_act = projected_usage(ls, active, u_act)
+        # Either way the reading is projected forward by its age: at the
+        # measured burn while reads land, conservatively once blind (see
+        # `judge_rotation`).  What was read is a lower bound on where the
+        # account is now, and this runs every tick, so the swap fires at the
+        # predicted moment rather than at whichever poll happens to land
+        # after it — and the announcement is made from the same figures.
+        u_act, why = judge_rotation(ls, active, self.usages.get(active), self.last_good, lr.cfg,
+                                    polling=lr.polling is not None)
         hold = self.hold_window(lr)
+        self.announce(lr, active, u_act, hold)
+        if now() - ls.get("last_swap", 0) < cfg.cooldown:
+            return
         if hold:
             self.hold_in_place(lr, active, u_act, *hold)
             return
@@ -4112,13 +4381,7 @@ class Master:
             ls["peak_hold"] = None        # the clock ended it; [r] clears it itself
             save_state(cfg, ls)
         other = self.displaced_by(lr)
-        reason = f"also live on {other}" if other else None
-        if reason is None:
-            reason = is_exhausted(u_act, lr.cfg)
-            if reason is None:
-                reason = about_to_exhaust(ls, active, u_act, lr.cfg)
-            if reason and age is not None:
-                reason += f" · usage read: {live.error if live else 'unavailable'}"
+        reason = f"also live on {other}" if other else why
         if reason and ended:
             reason = "peak-hour hold ended · " + reason
         if not reason:
@@ -4126,6 +4389,7 @@ class Master:
             if cfg.preempt:
                 self.maybe_preempt(lr, active)
             return
+        self.announce(lr, active, u_act, hold, starting=True)
         self.start_rotation(lr, reason, auto=True)
 
     def start_rotation(self, lr: LaneRt, reason: str, auto: bool, first: bool = False) -> None:
@@ -4186,7 +4450,8 @@ class Master:
             path = get_account(cfg, choice[0]).cred_path
         except CcrollError:
             return
-        self.submit(lr.key, f"checking {choice[0]} for {lr.host}", usage_for, path, urgent=True,
+        self.submit(lr.key, f"checking {choice[0]} for {lr.host}", usage_for, path, True, choice[0],
+                    urgent=True,
                     then=lambda fresh, e: self.on_preempt_read(lr, active, choice, fresh, e))
 
     def on_preempt_read(self, lr: LaneRt, active: str, choice: tuple, fresh, e) -> None:
@@ -4843,7 +5108,9 @@ class Master:
                      else f"this host: {viewer.host}  ·  master {self.host}")
             role = a.cyan(where) + a.dim(f"  ·  {linked} of {len(self.remote)} client hosts linked")
         lines = [head, role]
-        view = merged_view(self.usages, self.last_good, [lr.ls for lr in self.lanes()])
+        view = merged_view(self.usages, self.last_good, [lr.ls for lr in self.lanes()],
+                           self.cfg.interval,
+                           {lr.ls.get("active") for lr in self.lanes() if lr.polling is not None})
         for name, u in self.seed_view.items():
             view.setdefault(name, u)      # last run's samples, until this run reads it
         lines += render_table(a, self.table_rows(viewer, view, a), label)
