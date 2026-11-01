@@ -314,6 +314,15 @@ If the master goes away, the client keeps the last view on screen, dimmed under 
 | Rows showing `cached 12m · throttled` | The usage endpoint is throttling reads (429). The row shows the last good reading and its age, not an error. A full scan runs every `--scan` (600 s by default), one request a second. Raise it if throttling persists with many accounts. |
 | Rows showing `cached 2h00m · from last run` | The figures this run started from — the newest reading the previous run kept — until the scan reaches that account. |
 
+## Health check
+
+`tools/health.py` checks a running master from the outside: that a ccroll master process is up, that `state.json` is still being written, that every stored account has a recent reading, and that each client is linked. It prints a short report and exits 1 when something needs a look, so it fits a cron job. It reads only local files. With `--probe N` it also reads N accounts' usage endpoint per run, in turn, and logs which limit windows each reports (how the 5-hour window's removal on Ultra accounts was first seen). It never reads an account some machine is live on. `--state-age` and `--reading-age` set what counts as stale.
+
+```bash
+python3 tools/health.py            # local checks
+python3 tools/health.py --probe 3  # plus 3 accounts' usage
+```
+
 ## What ccroll writes, and where
 
 - `~/.claude-accounts/<name>/.credentials.json` — each account's tokens (0600), refreshed in place.
@@ -322,6 +331,7 @@ If the master goes away, the client keeps the last view on screen, dimmed under 
 - `~/.claude-accounts/.login-*/` — the temporary profile a `ccroll add` login runs in; renamed into place on success, and left for inspection (the path is printed) only when a failed login wrote something into it.
 - `~/.claude-accounts/.ccroll/master.sock` — the master's socket (0600), while `ccroll watch` runs. `ccroll add` and `adopt` report what they filed through it when a master runs, since the master owns `state.json` and would otherwise write over their changes.
 - `~/.claude-accounts/.ccroll/client.json` — on a client only (0600): the saved master link, a machine id when `/etc/machine-id` is missing, which account its live login is, swap results the master has not yet acknowledged (these carry the previous account's tokens), and its feed counter.
+- `~/.claude-accounts/.ccroll/health/` — only when `tools/health.py --probe` runs: which account it reads next, and a log of the limit windows each one reported.
 - `~/.claude/.credentials.json` (or `$CLAUDE_CONFIG_DIR`) — replaced atomically on each swap; harvested back into the store first so rotated refresh tokens survive.
 - `~/.claude/account-switch/{events.jsonl,state.json}` — the account-switch feed for other sessions (0700 dir): opaque account labels, timestamps and percentages, no emails and no secrets. `--no-signal` turns it off.
 - `~/.claude.json` — **only with `--sync-identity`, and only its `oauthAccount` key** (see the caveats). Never otherwise, and never replaced wholesale: that file also holds every project's session history.
