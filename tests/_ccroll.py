@@ -130,3 +130,51 @@ def feed_events(cfg) -> list:
         return []
     with open(path) as fh:
         return [json.loads(line) for line in fh if line.strip()]
+
+
+def baseline_with_scoped_rotation() -> types.ModuleType | None:
+    """The baseline with the one rule this tree adds laid over its own
+    primitives: the per-model (scoped) weekly window rotates, blocks and
+    counts in EITHER --by mode, where the baseline consulted it under
+    --by scoped only.  The differential tests judge against this, so every
+    other decision must still match the baseline exactly.  `load_baseline`
+    stays pristine for the replay, which reproduces the record as it was."""
+    import copy
+    base = load_baseline()
+    if base is None:
+        return None
+
+    def as_scoped(cfg):
+        c = copy.copy(cfg)
+        c.mode = "scoped"
+        return c
+
+    def is_exhausted(u, cfg, t=None):
+        # session first, then the governing weekly window, then the other —
+        # the order the new rule judges in
+        if u is None or u.error:
+            return None
+        if (u.status or "").lower() in ("rejected", "exceeded", "blocked"):
+            return f"status {u.status}"
+        weekly = (("weekly", "weekly", u.weekly_pct, u.weekly_reset, cfg.weekly_threshold),
+                  ("scoped", (u.scoped_label or "scoped").lower() + " weekly",
+                   u.scoped_pct, u.scoped_reset, cfg.scoped_threshold))
+        windows = (("session", "session", u.session_pct, u.session_reset, cfg.threshold),) + (
+            weekly if cfg.mode == "weekly" else weekly[::-1])
+        for key, label, pct, reset, thr in windows:
+            if base.window_spent(pct, reset, thr, t):
+                return f"{label} " + base.pct_text(u, key, pct)
+        return None
+
+    blocked, recovery, utilisation = base.blocked_until, base.recovery_moment, base.rotation_utilisation
+    limit, threshold, comfortable = base.limit_etas, base.threshold_etas, base.comfortable
+    base.is_exhausted = is_exhausted
+    base.blocked_until = lambda u, cfg, t=None: blocked(u, as_scoped(cfg), t)
+    base.recovery_moment = lambda u, cfg, t: recovery(u, as_scoped(cfg), t)
+    base.rotation_utilisation = lambda u, cfg: utilisation(u, as_scoped(cfg))
+    base.limit_etas = lambda state, name, u, cfg: limit(state, name, u, as_scoped(cfg))
+    base.threshold_etas = lambda state, name, u, cfg: threshold(state, name, u, as_scoped(cfg))
+    base.comfortable = lambda u, cfg, preload=None, t=None: (
+        comfortable(u, cfg, preload, t)
+        and base.effective_pct(u.scoped_pct, u.scoped_reset, t) < 90)
+    return base

@@ -1,7 +1,9 @@
 """With reads landing (no refusal; a reading older than the interval only
 while the next poll is out) every rotation decision is exactly the
 baseline's: randomized states, readings and settings, judged by both, with
-each reading stamped as far in the past as a real lane's would be."""
+each reading stamped as far in the past as a real lane's would be.  The
+baseline is read with the scoped window rotating in either --by mode
+(`baseline_with_scoped_rotation`), the one rule added since."""
 import os
 import random
 import unittest
@@ -103,7 +105,7 @@ def windows(u):
 
 class Differential(unittest.TestCase):
     def test_fresh_reads_rotate_exactly_as_before(self):
-        base = T.load_baseline()
+        base = T.baseline_with_scoped_rotation()
         if base is None:
             self.skipTest("no baseline (git history or CCROLL_BASELINE)")
         new = T.load()
@@ -129,7 +131,7 @@ class Differential(unittest.TestCase):
 
     def test_master_tick_rotates_exactly_as_before(self):
         """The dashboard's own per-tick path, both versions, same inputs."""
-        base = T.load_baseline()
+        base = T.baseline_with_scoped_rotation()
         if base is None:
             self.skipTest("no baseline (git history or CCROLL_BASELINE)")
         new = T.load()

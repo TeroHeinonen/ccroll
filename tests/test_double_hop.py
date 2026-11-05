@@ -138,7 +138,7 @@ class TargetChoiceDifferential(unittest.TestCase):
     earliest-reset open candidate whose landed runway clears the gate."""
 
     def test_choice_differs_only_where_preemption_could_act(self):
-        base = T.load_baseline()
+        base = T.baseline_with_scoped_rotation()
         if base is None:
             self.skipTest("no baseline (git history or CCROLL_BASELINE)")
         new = T.load()

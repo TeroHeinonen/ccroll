@@ -517,9 +517,11 @@ class Cfg:
                 self.peak_tz = zoneinfo.ZoneInfo(tz)
             except (zoneinfo.ZoneInfoNotFoundError, ValueError) as e:
                 raise CcrollError(f"unknown time zone {tz!r} for --peak-tz: {e}")
-        # which weekly limit governs exhaustion + next-account choice:
-        # "scoped" = the per-model weekly limit (Fable on current Max plans),
-        # "weekly" = the all-models weekly limit.
+        # which weekly limit governs next-account choice, pre-emption and
+        # the forecast's cycle: "scoped" = the per-model weekly limit (Fable
+        # on current Max plans), "weekly" = the all-models weekly limit.
+        # Rotation itself fires on ANY window over its threshold, whatever
+        # the mode (`is_exhausted`).
         self.mode = getattr(args, "by", None) or "weekly"
 
 
@@ -842,8 +844,8 @@ def has_reading(u: "Usage | None") -> bool:
 
 def burn_key(u: Usage, cfg: Cfg) -> str:
     """The window whose fit paces this account: the session's, or, when the
-    reading has no session window, the weekly one that governs rotation
-    (all-models when the account has no scoped window)."""
+    reading has no session window, the weekly one that governs ranking
+    (`--by`; all-models when the account has no scoped window)."""
     if u.session_pct is not None:
         return "session"
     return "scoped" if cfg.mode == "scoped" and u.scoped_pct is not None else "weekly"
@@ -1624,7 +1626,8 @@ def fleet_forecast(state: dict, name: str, u: Usage, cfg: Cfg, n_accounts: int) 
     swaps_wk = (WEEK_H / cycle_h) if cycle_h else 0.0
 
     windows = []
-    for key, thr in ((govern, govern_thr),) + ((("weekly", cfg.weekly_threshold),) if govern != "weekly" else ()):
+    other = ("scoped", cfg.scoped_threshold) if govern == "weekly" else ("weekly", cfg.weekly_threshold)
+    for key, thr in ((govern, govern_thr), other):
         r = rate(key)
         cap = n_accounts * thr
         if r is None:
@@ -1974,9 +1977,8 @@ def rotation_utilisation(u: "Usage | None", cfg: Cfg) -> float | None:
     rotation — the one figure the protocol's `usage_pct` carries."""
     if u is None or u.error:
         return None
-    pcts = [(u.session_pct, u.session_reset), (u.weekly_pct, u.weekly_reset)]
-    if cfg.mode == "scoped":
-        pcts.append((u.scoped_pct, u.scoped_reset))
+    pcts = [(u.session_pct, u.session_reset), (u.weekly_pct, u.weekly_reset),
+            (u.scoped_pct, u.scoped_reset)]
     live = [effective_pct(p, r) for p, r in pcts if p is not None]
     return max(live) if live else None
 
@@ -2183,18 +2185,29 @@ def is_exhausted(u: Usage | None, cfg: Cfg, t: float | None = None) -> str | Non
 
     `t` is the moment to judge at (default now): a window whose reset has
     passed by then no longer counts, so the same reading can be asked what
-    it will look like once the fleet has recovered."""
+    it will look like once the fleet has recovered.
+
+    Every window the endpoint reports can spend the account: the session,
+    the all-models weekly and the per-model (scoped) weekly.  `--by` only
+    says which weekly window picks the *next* account; it never exempts a
+    window from rotation.  A full scoped window refuses every request for
+    that model, and a session working on it hangs on the refusal exactly as
+    it does on a full session — it does not fall back to another model, and
+    does not recover without a hand."""
     if u is None or u.error:
         return None  # never rotate on missing data
     if (u.status or "").lower() in ("rejected", "exceeded", "blocked"):
         return f"status {u.status}"
     if window_spent(u.session_pct, u.session_reset, cfg.threshold, t):
         return "session " + pct_text(u, "session", u.session_pct)
-    if cfg.mode == "scoped" and window_spent(u.scoped_pct, u.scoped_reset, cfg.scoped_threshold, t):
-        return (f"{(u.scoped_label or 'scoped').lower()} weekly "
-                + pct_text(u, "scoped", u.scoped_pct))
-    if window_spent(u.weekly_pct, u.weekly_reset, cfg.weekly_threshold, t):
-        return "weekly " + pct_text(u, "weekly", u.weekly_pct)
+    # both weekly windows spend the account; the governing one is named first
+    weekly = (("weekly", u.weekly_pct, u.weekly_reset, cfg.weekly_threshold),
+              ((u.scoped_label or "scoped").lower() + " weekly", u.scoped_pct, u.scoped_reset,
+               cfg.scoped_threshold))
+    for label, pct, reset, thr in (weekly if cfg.mode == "weekly" else weekly[::-1]):
+        if window_spent(pct, reset, thr, t):
+            key = "weekly" if label == "weekly" else "scoped"
+            return f"{label} " + pct_text(u, key, pct)
     return None
 
 
@@ -2204,16 +2217,16 @@ def blocked_until(u: Usage | None, cfg: Cfg, t: float | None = None) -> float | 
     threshold is spent for rotation's purposes but still serves requests;
     what holds a session is a window the endpoint reports full (FULL_PCT),
     and it holds until the latest such window resets.  The scoped window
-    counts only in scoped mode, as everywhere else: it blocks that model's
-    requests, which is what the fleet is being run for.  Judged at `t`, so
+    counts like the other two: it blocks that model's requests, which is
+    what the sessions are making.  Judged at `t`, so
     the same reading can be asked whether the account will still be
     refusing a lead time from now."""
     if u is None or u.error:
         return None
     t = now() if t is None else t
     resets = []
-    for pct, reset in ((u.session_pct, u.session_reset), (u.weekly_pct, u.weekly_reset)) + (
-            ((u.scoped_pct, u.scoped_reset),) if cfg.mode == "scoped" else ()):
+    for pct, reset in ((u.session_pct, u.session_reset), (u.weekly_pct, u.weekly_reset),
+                       (u.scoped_pct, u.scoped_reset)):
         if window_spent(pct, reset, FULL_PCT, t) and reset and reset > t:
             resets.append(reset)
     return max(resets) if resets else None
@@ -2565,10 +2578,9 @@ def limit_etas(state: dict, name: str, u: Usage, cfg: Cfg) -> list:
     rotation on the active account, in display order; `rate` is None when
     the window has no burn estimate yet."""
     windows = [("session", "session", u.session_pct, u.session_reset),
-               ("weekly", "weekly", u.weekly_pct, u.weekly_reset)]
-    if cfg.mode == "scoped":
-        windows.append(("scoped", (u.scoped_label or "scoped").lower() + " weekly",
-                        u.scoped_pct, u.scoped_reset))
+               ("weekly", "weekly", u.weekly_pct, u.weekly_reset),
+               ("scoped", (u.scoped_label or "scoped").lower() + " weekly",
+                u.scoped_pct, u.scoped_reset)]
     out = []
     for key, label, pct, reset in windows:
         if pct is None:
@@ -2602,10 +2614,9 @@ def eta_to_threshold(pct: float | None, rate: float | None, threshold: float) ->
 def threshold_etas(state: dict, name: str, u: Usage, cfg: Cfg) -> list:
     """(key, label, pct, rate, eta-to-threshold) per rotating window."""
     windows = [("session", "session", u.session_pct, u.session_reset, cfg.threshold),
-               ("weekly", "weekly", u.weekly_pct, u.weekly_reset, cfg.weekly_threshold)]
-    if cfg.mode == "scoped":
-        windows.append(("scoped", (u.scoped_label or "scoped").lower() + " weekly",
-                        u.scoped_pct, u.scoped_reset, cfg.scoped_threshold))
+               ("weekly", "weekly", u.weekly_pct, u.weekly_reset, cfg.weekly_threshold),
+               ("scoped", (u.scoped_label or "scoped").lower() + " weekly",
+                u.scoped_pct, u.scoped_reset, cfg.scoped_threshold)]
     out = []
     for key, label, pct, reset, thr in windows:
         if pct is None:
@@ -2658,7 +2669,8 @@ def about_to_exhaust(state: dict, name: str, u: Usage | None, cfg: Cfg) -> str |
 
 
 def governing_window(u: Usage, cfg: Cfg) -> tuple[float | None, float | None]:
-    """(pct, reset) of the weekly window that governs rotation in this mode."""
+    """(pct, reset) of the weekly window that ranks the next account in this
+    mode (`--by`).  Rotation itself fires on any window: `is_exhausted`."""
     if cfg.mode == "weekly":
         return u.weekly_pct, u.weekly_reset
     return u.scoped_pct, u.scoped_reset
@@ -2770,8 +2782,7 @@ def comfortable(u: Usage, cfg: Cfg, preload: dict | None = None,
     sess = effective_pct(u.session_pct, u.session_reset, t)
     week = effective_pct(u.weekly_pct, u.weekly_reset, t)
     scoped = effective_pct(u.scoped_pct, u.scoped_reset, t)
-    if not (sess < cfg.threshold - 15 and week < 95
-            and (cfg.mode != "scoped" or scoped < 90)):
+    if not (sess < cfg.threshold - 15 and week < 95 and scoped < 90):
         return False
     if preload:
         need_s = preload.get("session")
@@ -2937,8 +2948,7 @@ def recovery_moment(u: Usage, cfg: Cfg, t: float) -> float | None:
     resets = []
     if window_spent(u.session_pct, u.session_reset, cfg.threshold, t) and u.session_reset:
         resets.append(u.session_reset)
-    if cfg.mode == "scoped" and window_spent(u.scoped_pct, u.scoped_reset,
-                                             cfg.scoped_threshold, t) and u.scoped_reset:
+    if window_spent(u.scoped_pct, u.scoped_reset, cfg.scoped_threshold, t) and u.scoped_reset:
         resets.append(u.scoped_reset)
     if window_spent(u.weekly_pct, u.weekly_reset, cfg.weekly_threshold, t) and u.weekly_reset:
         resets.append(u.weekly_reset)
@@ -5134,8 +5144,8 @@ class Master:
         label = scoped_label_of(self.usages)
         active = ls.get("active")
         fleet = bool(self.remote)
-        govern = (f"{label.lower()}≥{cfg.scoped_threshold:.0f}%" if cfg.mode == "scoped"
-                  else f"weekly·all≥{cfg.weekly_threshold:.0f}%")
+        govern = (f"weekly·all≥{cfg.weekly_threshold:.0f}% / {label.lower()}≥{cfg.scoped_threshold:.0f}%"
+                  f" · next by {label.lower() if cfg.mode == 'scoped' else 'weekly·all'}")
         early = (f" · early to next reset when runway>{cfg.preempt_runway / 3600:g}h"
                  + (" +touch" if cfg.touch else "")) if cfg.preempt else ""
         win = peak_window(cfg)
@@ -6417,9 +6427,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--claude-dir", help="live Claude config dir (default $CLAUDE_CONFIG_DIR or ~/.claude)")
     p.add_argument("--no-color", action="store_true")
     p.add_argument("--by", choices=("scoped", "weekly"), default="weekly",
-                   help="which weekly limit governs rotation and next-account choice: "
+                   help="which weekly limit picks the next account (and paces pre-emption): "
                         "'scoped' = the per-model weekly limit (Fable on current Max plans), "
-                        "'weekly' = the all-models weekly limit (default: weekly)")
+                        "'weekly' = the all-models weekly limit (default: weekly). "
+                        "Rotation fires on any of the three windows in either mode.")
     sub = p.add_subparsers(dest="cmd")
 
     w = sub.add_parser("watch", help="live dashboard + auto-rotation (default)")
